@@ -92,6 +92,7 @@ describe("PayloadStore", () => {
     ["maxEntries", 0, {maxEntries: 0}],
     ["keepSlots", -1, {keepSlots: -1}],
     ["maxEntries", 1.5, {maxEntries: 1.5}],
+    ["keepSlots", Number.MAX_SAFE_INTEGER + 1, {keepSlots: Number.MAX_SAFE_INTEGER + 1}],
   ] as const)("rejects an invalid %s option", (option, value, options) => {
     const error = getPayloadStoreError(() => new PayloadStore(options));
 
