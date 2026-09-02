@@ -60,7 +60,7 @@ describe("payload build pipeline", () => {
     const stored = store.add({slot: 10, parentBlockRoot, payload});
 
     expect(notifyForkchoiceUpdate).toHaveBeenCalledOnce();
-    expect(getPayload).toHaveBeenCalledWith(ForkName.gloas, "0x0102030405060708");
+    expect(getPayload).toHaveBeenCalledWith(ForkName.gloas, "0x0102030405060708", expect.any(AbortSignal));
     expect(stored.status).toBe("stored");
     expect(stored.record.payload).toBe(payload);
     expect(stored.record.payload.executionPayload).toBe(executionPayload);
