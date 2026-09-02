@@ -39,7 +39,7 @@ describe("PayloadStore", () => {
     expect(store.size).toBe(1);
   });
 
-  it("fails closed when unexpired records reach the capacity bound", async () => {
+  it("fails closed when unexpired records reach the capacity bound", () => {
     const store = new PayloadStore({maxEntries: 1});
     store.add({slot: 10, parentBlockRoot: getRoot(2), payload: getBuiltPayload(ForkName.gloas, 1)});
 
