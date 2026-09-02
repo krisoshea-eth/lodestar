@@ -50,7 +50,15 @@ describe("Builder lifecycle component pipeline", () => {
       signer,
       ledger,
       builderIndex,
-      hasPayload: (hash) => store.get(hash) !== null,
+      hasPayload: (identity) => {
+        const stored = store.get(identity.blockHash);
+        return (
+          stored !== null &&
+          stored.slot === identity.slot &&
+          toRootHex(stored.parentBlockRoot) === identity.parentBlockRoot &&
+          toRootHex(stored.payload.executionPayload.parentHash) === identity.parentBlockHash
+        );
+      },
     });
     const signedBid = await publisher.publish(bid, new AbortController().signal);
 
