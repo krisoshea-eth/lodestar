@@ -135,6 +135,18 @@ describe("SlotBidder", () => {
     expect(modules.policy.computeValue).toHaveBeenCalledWith({payloadValueGwei: 10, coverableGwei: 60});
   });
 
+  it("preserves the configured operating balance when computing coverable value", async () => {
+    const minOperatingBalanceGwei = MIN_DEPOSIT_AMOUNT + 25;
+    const {bidder, modules} = setup(builtPayload(ForkName.gloas), {
+      builderStatus: {status: "active", balance: minOperatingBalanceGwei + 100},
+      minOperatingBalanceGwei,
+    });
+
+    await bidder.run(gloasInput(), new AbortController().signal);
+
+    expect(modules.policy.computeValue).toHaveBeenCalledWith({payloadValueGwei: 10, coverableGwei: 100});
+  });
+
   it("rejects an input whose slot does not match its payload attributes", async () => {
     const input = gloasInput();
     input.job.request.payloadAttributes.slotNumber++;
@@ -237,11 +249,12 @@ function setup(
     builderStatus?: ReturnType<SlotBidderModules["getBuilderStatus"]>;
     policyValue?: number | null;
     ledger?: BidLedger;
+    minOperatingBalanceGwei?: number;
   } = {}
 ) {
   const {modules, publish, store} = setupModules(payload, opts);
   return {
-    bidder: new SlotBidder(modules, {minOperatingBalanceGwei: MIN_DEPOSIT_AMOUNT}),
+    bidder: new SlotBidder(modules, {minOperatingBalanceGwei: opts.minOperatingBalanceGwei ?? MIN_DEPOSIT_AMOUNT}),
     modules,
     publish,
     store,

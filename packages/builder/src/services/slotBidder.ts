@@ -181,7 +181,7 @@ export class SlotBidder {
     }
 
     const unsettledValueGwei = this.modules.ledger.getUnsettledValueGwei(computeEpochAtSlot(input.slot));
-    const coverableGwei = Math.max(balance - MIN_DEPOSIT_AMOUNT - unsettledValueGwei, 0);
+    const coverableGwei = Math.max(balance - this.options.minOperatingBalanceGwei - unsettledValueGwei, 0);
     const valueGwei = this.modules.policy.computeValue({
       payloadValueGwei: Number(payloadValueGweiBigint),
       coverableGwei,
