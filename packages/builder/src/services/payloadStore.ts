@@ -1,32 +1,89 @@
-import {ForkPostGloas} from "@lodestar/params";
-import {BlobsBundle, ExecutionPayload, Root, RootHex, Slot, gloas} from "@lodestar/types";
+import type {ForkPostGloas} from "@lodestar/params";
+import type {BlobsBundle, ExecutionPayload, ExecutionRequests, Root, RootHex, Slot} from "@lodestar/types";
+import {LodestarError, toRootHex} from "@lodestar/utils";
 
 // NOTE: BuiltPayload will migrate to payloadSource.ts when the payload source lands; the store
 // holds it here for now.
-export type BuiltPayload = {
+export type BuiltPayload<F extends ForkPostGloas = ForkPostGloas> = {
   sourceId: string;
-  executionPayload: ExecutionPayload<ForkPostGloas>;
-  executionRequests: gloas.ExecutionRequests;
-  blobsBundle: BlobsBundle<ForkPostGloas>;
+  fork: F;
+  executionPayload: ExecutionPayload<F>;
+  executionRequests: ExecutionRequests<F>;
+  blobsBundle: BlobsBundle<F>;
   /** Value of the payload to the fee recipient in wei, as reported by the execution client */
   executionPayloadValue: bigint;
 };
 
-export type StoredPayload = {
+export type StorePayloadInput<F extends ForkPostGloas = ForkPostGloas> = {
   slot: Slot;
   parentBlockRoot: Root;
-  blockHash: RootHex;
-  payload: BuiltPayload;
+  payload: BuiltPayload<F>;
 };
 
-/** Keep payloads for this many slots after their target slot, late blocks may still commit to them */
-const KEEP_SLOTS = 2;
+export type StoredPayload<F extends ForkPostGloas = ForkPostGloas> = StorePayloadInput<F> & {
+  blockHash: RootHex;
+};
+
+export type StorePayloadResult =
+  | {status: "stored"; record: StoredPayload}
+  | {status: "already_stored"; record: StoredPayload};
+
+export type PayloadStoreOptions = {
+  maxEntries?: number;
+  keepSlots?: number;
+};
+
+export enum PayloadStoreErrorCode {
+  INVALID_OPTION = "PAYLOAD_STORE_ERROR_INVALID_OPTION",
+  CAPACITY_REACHED = "PAYLOAD_STORE_ERROR_CAPACITY_REACHED",
+}
+
+export type PayloadStoreErrorType =
+  | {
+      code: PayloadStoreErrorCode.INVALID_OPTION;
+      option: keyof PayloadStoreOptions;
+      value: number;
+    }
+  | {
+      code: PayloadStoreErrorCode.CAPACITY_REACHED;
+      blockHash: RootHex;
+      maxEntries: number;
+    };
+
+export class PayloadStoreError extends LodestarError<PayloadStoreErrorType> {}
+
+const DEFAULT_MAX_ENTRIES = 256;
+const DEFAULT_KEEP_SLOTS = 2;
 
 export class PayloadStore {
   private readonly byBlockHash = new Map<RootHex, StoredPayload>();
+  private readonly maxEntries: number;
+  private readonly keepSlots: number;
 
-  add(payload: StoredPayload): void {
-    this.byBlockHash.set(payload.blockHash, payload);
+  constructor({maxEntries = DEFAULT_MAX_ENTRIES, keepSlots = DEFAULT_KEEP_SLOTS}: PayloadStoreOptions = {}) {
+    this.assertOption("maxEntries", maxEntries, 1);
+    this.assertOption("keepSlots", keepSlots, 0);
+    this.maxEntries = maxEntries;
+    this.keepSlots = keepSlots;
+  }
+
+  add<F extends ForkPostGloas>(input: StorePayloadInput<F>): StorePayloadResult {
+    const blockHash = toRootHex(input.payload.executionPayload.blockHash);
+    const existing = this.byBlockHash.get(blockHash);
+    if (existing !== undefined) {
+      return {status: "already_stored", record: existing};
+    }
+
+    if (this.byBlockHash.size >= this.maxEntries) {
+      throw new PayloadStoreError(
+        {code: PayloadStoreErrorCode.CAPACITY_REACHED, blockHash, maxEntries: this.maxEntries},
+        `Payload store capacity reached blockHash=${blockHash} maxEntries=${this.maxEntries}`
+      );
+    }
+
+    const record: StoredPayload<F> = {...input, blockHash};
+    this.byBlockHash.set(blockHash, record);
+    return {status: "stored", record};
   }
 
   get(blockHash: RootHex): StoredPayload | null {
@@ -37,15 +94,31 @@ export class PayloadStore {
     return this.byBlockHash.has(blockHash);
   }
 
-  prune(currentSlot: Slot): void {
+  delete(blockHash: RootHex): boolean {
+    return this.byBlockHash.delete(blockHash);
+  }
+
+  prune(currentSlot: Slot): number {
+    let removed = 0;
     for (const [blockHash, {slot}] of this.byBlockHash) {
-      if (slot + KEEP_SLOTS < currentSlot) {
+      if (slot + this.keepSlots < currentSlot) {
         this.byBlockHash.delete(blockHash);
+        removed++;
       }
     }
+    return removed;
   }
 
   get size(): number {
     return this.byBlockHash.size;
+  }
+
+  private assertOption(option: keyof PayloadStoreOptions, value: number, minimum: number): void {
+    if (!Number.isInteger(value) || value < minimum) {
+      throw new PayloadStoreError(
+        {code: PayloadStoreErrorCode.INVALID_OPTION, option, value},
+        `Invalid payload store option option=${option} value=${value}`
+      );
+    }
   }
 }
