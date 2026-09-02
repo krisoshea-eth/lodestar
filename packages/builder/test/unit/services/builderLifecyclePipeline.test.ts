@@ -10,6 +10,7 @@ import {BidLedger} from "../../../src/services/bidLedger.js";
 import {BidPublisher} from "../../../src/services/bidPublisher.js";
 import {BidSelector} from "../../../src/services/bidSelector.js";
 import {BuilderSigner} from "../../../src/services/builderSigner.js";
+import {EnvelopePublisher} from "../../../src/services/envelopePublisher.js";
 import {createExecutionPayloadBid} from "../../../src/services/executionPayloadBid.js";
 import {createExecutionPayloadEnvelopeMaterial} from "../../../src/services/executionPayloadEnvelope.js";
 import type {BuiltPayload} from "../../../src/services/payloadSource.js";
@@ -87,22 +88,28 @@ describe("Builder lifecycle component pipeline", () => {
       selectedBid: selection.bid,
       payload: stored.payload,
     });
-    const signedExecutionPayloadEnvelope = signer.signExecutionPayloadEnvelope(material.envelope);
-    await (
-      await api.beacon.publishExecutionPayloadEnvelope({
-        signedEnvelopeOrContents: {
-          signedExecutionPayloadEnvelope,
-          kzgProofs: material.kzgProofs,
-          blobs: material.blobs,
-        },
-      })
-    ).assertOk();
+    const envelopePublisher = new EnvelopePublisher({
+      api,
+      signer,
+      ledger,
+      builderIndex,
+      hasSelection: (identity) =>
+        identity.slot === selection.bid.slot &&
+        identity.parentBlockHash === selection.bid.parentBlockHash &&
+        identity.parentBlockRoot === selection.bid.parentBlockRoot &&
+        identity.blockHash === selection.bid.blockHash &&
+        identity.blockRoot === selection.blockRoot,
+    });
+    const publication = await envelopePublisher.publish(material, new AbortController().signal);
+    if (publication.status !== "published") {
+      throw Error("Expected envelope publication");
+    }
 
     expect(api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
     expect(api.beacon.publishExecutionPayloadEnvelope).toHaveBeenCalledOnce();
     expect(selection.bid.wonBlockRoots).toEqual([blockRoot]);
-    expect(signedExecutionPayloadEnvelope.message.payload).toBe(payload.executionPayload);
-    expect(signedExecutionPayloadEnvelope.message.executionRequests).toBe(payload.executionRequests);
+    expect(publication.signedEnvelope.message.payload).toBe(payload.executionPayload);
+    expect(publication.signedEnvelope.message.executionRequests).toBe(payload.executionRequests);
   });
 });
 
