@@ -114,7 +114,7 @@ export class PayloadStore {
   }
 
   private assertOption(option: keyof PayloadStoreOptions, value: number, minimum: number): void {
-    if (!Number.isInteger(value) || value < minimum) {
+    if (!Number.isSafeInteger(value) || value < minimum) {
       throw new PayloadStoreError(
         {code: PayloadStoreErrorCode.INVALID_OPTION, option, value},
         `Invalid payload store option option=${option} value=${value}`
