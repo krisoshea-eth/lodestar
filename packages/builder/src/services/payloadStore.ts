@@ -1,5 +1,13 @@
 import type {ForkPostGloas} from "@lodestar/params";
-import type {BlobsBundle, ExecutionPayload, ExecutionRequests, Root, RootHex, Slot} from "@lodestar/types";
+import {
+  type BlobsBundle,
+  type ExecutionPayload,
+  type ExecutionRequests,
+  type Root,
+  type RootHex,
+  type Slot,
+  ssz,
+} from "@lodestar/types";
 import {LodestarError, toRootHex} from "@lodestar/utils";
 
 // NOTE: BuiltPayload will migrate to payloadSource.ts when the payload source lands; the store
@@ -22,6 +30,18 @@ export type StorePayloadInput<F extends ForkPostGloas = ForkPostGloas> = {
 
 export type StoredPayload<F extends ForkPostGloas = ForkPostGloas> = StorePayloadInput<F> & {
   blockHash: RootHex;
+};
+
+type SerializedStoredPayload<F extends ForkPostGloas = ForkPostGloas> = {
+  slot: Slot;
+  parentBlockRoot: Root;
+  blockHash: RootHex;
+  sourceId: string;
+  fork: F;
+  executionPayload: Uint8Array;
+  executionRequests: Uint8Array;
+  blobsBundle: Uint8Array;
+  executionPayloadValue: bigint;
 };
 
 export type StorePayloadResult =
@@ -56,7 +76,7 @@ const DEFAULT_MAX_ENTRIES = 256;
 const DEFAULT_KEEP_SLOTS = 2;
 
 export class PayloadStore {
-  private readonly byBlockHash = new Map<RootHex, StoredPayload>();
+  private readonly byBlockHash = new Map<RootHex, SerializedStoredPayload>();
   private readonly maxEntries: number;
   private readonly keepSlots: number;
 
@@ -71,7 +91,7 @@ export class PayloadStore {
     const blockHash = toRootHex(input.payload.executionPayload.blockHash);
     const existing = this.byBlockHash.get(blockHash);
     if (existing !== undefined) {
-      return {status: "already_stored", record: existing};
+      return {status: "already_stored", record: deserializeStoredPayload(existing)};
     }
 
     if (this.byBlockHash.size >= this.maxEntries) {
@@ -81,13 +101,25 @@ export class PayloadStore {
       );
     }
 
-    const record: StoredPayload<F> = {...input, blockHash};
+    const forkTypes = ssz[input.payload.fork];
+    const record: SerializedStoredPayload<F> = {
+      slot: input.slot,
+      parentBlockRoot: Uint8Array.from(input.parentBlockRoot),
+      blockHash,
+      sourceId: input.payload.sourceId,
+      fork: input.payload.fork,
+      executionPayload: forkTypes.ExecutionPayload.serialize(input.payload.executionPayload),
+      executionRequests: forkTypes.ExecutionRequests.serialize(input.payload.executionRequests),
+      blobsBundle: forkTypes.BlobsBundle.serialize(input.payload.blobsBundle),
+      executionPayloadValue: input.payload.executionPayloadValue,
+    };
     this.byBlockHash.set(blockHash, record);
-    return {status: "stored", record};
+    return {status: "stored", record: deserializeStoredPayload(record)};
   }
 
   get(blockHash: RootHex): StoredPayload | null {
-    return this.byBlockHash.get(blockHash) ?? null;
+    const record = this.byBlockHash.get(blockHash);
+    return record === undefined ? null : deserializeStoredPayload(record);
   }
 
   has(blockHash: RootHex): boolean {
@@ -121,4 +153,21 @@ export class PayloadStore {
       );
     }
   }
+}
+
+function deserializeStoredPayload<F extends ForkPostGloas>(record: SerializedStoredPayload<F>): StoredPayload<F> {
+  const forkTypes = ssz[record.fork];
+  return {
+    slot: record.slot,
+    parentBlockRoot: Uint8Array.from(record.parentBlockRoot),
+    blockHash: record.blockHash,
+    payload: {
+      sourceId: record.sourceId,
+      fork: record.fork,
+      executionPayload: forkTypes.ExecutionPayload.deserialize(record.executionPayload),
+      executionRequests: forkTypes.ExecutionRequests.deserialize(record.executionRequests),
+      blobsBundle: forkTypes.BlobsBundle.deserialize(record.blobsBundle),
+      executionPayloadValue: record.executionPayloadValue,
+    },
+  };
 }

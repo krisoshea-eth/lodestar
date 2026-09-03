@@ -1,8 +1,13 @@
 import {describe, expect, it} from "vitest";
-import {ForkName} from "@lodestar/params";
-import type {Root} from "@lodestar/types";
+import {ForkName, type ForkPostGloas} from "@lodestar/params";
+import {type Root, ssz} from "@lodestar/types";
 import {toRootHex} from "@lodestar/utils";
-import {PayloadStore, PayloadStoreError, PayloadStoreErrorCode} from "../../../src/services/payloadStore.js";
+import {
+  type BuiltPayload,
+  PayloadStore,
+  PayloadStoreError,
+  PayloadStoreErrorCode,
+} from "../../../src/services/payloadStore.js";
 import {mockBuiltPayload} from "../utils/payload.js";
 
 describe("PayloadStore", () => {
@@ -16,12 +21,13 @@ describe("PayloadStore", () => {
 
     expect(result.status).toBe("stored");
     expect(result.record.blockHash).toBe(blockHash);
-    expect(result.record.parentBlockRoot).toBe(parentBlockRoot);
-    expect(result.record.payload).toBe(payload);
-    expect(result.record.payload.blobsBundle).toBe(payload.blobsBundle);
-    expect(result.record.payload.executionRequests).toBe(payload.executionRequests);
+    expect(result.record.parentBlockRoot).toEqual(parentBlockRoot);
+    expect(result.record.parentBlockRoot).not.toBe(parentBlockRoot);
+    expectPayloadsEqual(result.record.payload, payload);
+    expect(result.record.payload).not.toBe(payload);
     expect(store.has(blockHash)).toBe(true);
-    expect(store.get(blockHash)).toBe(result.record);
+    expect(store.get(blockHash)).toEqual(result.record);
+    expect(store.get(blockHash)).not.toBe(result.record);
   });
 
   it("preserves the first record for an existing block hash", () => {
@@ -33,9 +39,28 @@ describe("PayloadStore", () => {
     const duplicate = store.add({slot: 11, parentBlockRoot: getRoot(3), payload: duplicatePayload});
 
     expect(duplicate.status).toBe("already_stored");
-    expect(duplicate.record).toBe(first.record);
-    expect(duplicate.record.payload).toBe(firstPayload);
+    expect(duplicate.record).toEqual(first.record);
+    expect(duplicate.record).not.toBe(first.record);
+    expectPayloadsEqual(duplicate.record.payload, firstPayload);
     expect(store.size).toBe(1);
+  });
+
+  it("does not expose mutable retained payload material", () => {
+    const store = new PayloadStore();
+    const payload = mockBuiltPayload({fork: ForkName.gloas, blockHash: getRoot(1)});
+    const parentBlockRoot = getRoot(2);
+    const result = store.add({slot: 10, parentBlockRoot, payload});
+    const blockHash = result.record.blockHash;
+
+    payload.executionPayload.parentHash[0] = 9;
+    parentBlockRoot[0] = 9;
+    expect(store.get(blockHash)?.payload.executionPayload.parentHash[0]).toBe(1);
+    expect(store.get(blockHash)?.parentBlockRoot[0]).toBe(2);
+
+    result.record.payload.executionPayload.parentHash[0] = 8;
+    result.record.parentBlockRoot[0] = 8;
+    expect(store.get(blockHash)?.payload.executionPayload.parentHash[0]).toBe(1);
+    expect(store.get(blockHash)?.parentBlockRoot[0]).toBe(2);
   });
 
   it("fails closed when unexpired records reach the capacity bound", () => {
@@ -93,7 +118,8 @@ describe("PayloadStore", () => {
 
     const result = store.add({slot: 10, parentBlockRoot: getRoot(2), payload});
 
-    expect(result.record.payload).toBe(payload);
+    expectPayloadsEqual(result.record.payload, payload);
+    expect(result.record.payload).not.toBe(payload);
     expect(result.record.payload.fork).toBe(ForkName.heze);
   });
 
@@ -115,6 +141,16 @@ describe("PayloadStore", () => {
 
 function getRoot(byte: number): Root {
   return Uint8Array.from({length: 32}, () => byte);
+}
+
+function expectPayloadsEqual<F extends ForkPostGloas>(actual: BuiltPayload<F>, expected: BuiltPayload<F>): void {
+  const forkTypes = ssz[expected.fork];
+  expect(actual.sourceId).toBe(expected.sourceId);
+  expect(actual.fork).toBe(expected.fork);
+  expect(actual.executionPayloadValue).toBe(expected.executionPayloadValue);
+  expect(forkTypes.ExecutionPayload.equals(actual.executionPayload, expected.executionPayload)).toBe(true);
+  expect(forkTypes.ExecutionRequests.equals(actual.executionRequests, expected.executionRequests)).toBe(true);
+  expect(forkTypes.BlobsBundle.equals(actual.blobsBundle, expected.blobsBundle)).toBe(true);
 }
 
 function getPayloadStoreError(fn: () => unknown): PayloadStoreError {
