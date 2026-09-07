@@ -98,7 +98,7 @@ describe("Builder lifecycle component pipeline", () => {
         blockRoot,
         builderIndex,
         selectedBid: selection.bid,
-        payload: stored.payload,
+      storedPayload: stored,
       });
       const envelopePublisher = new EnvelopePublisher({
         api,
