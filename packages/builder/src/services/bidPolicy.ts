@@ -1,5 +1,3 @@
-import {LodestarError} from "@lodestar/utils";
-
 export type BidContext = {
   /** Value of the payload to the builder's fee recipient, as reported by the execution client */
   payloadValueGwei: number;
@@ -23,57 +21,33 @@ export type ProportionalBidPolicyOpts = {
   maxValueGwei?: number;
 };
 
-type BidPolicyOption = keyof ProportionalBidPolicyOpts;
-type BidPolicyContextField = keyof BidContext;
-
-export enum BidPolicyErrorCode {
-  INVALID_OPTION = "BID_POLICY_ERROR_INVALID_OPTION",
-  INVALID_CONTEXT = "BID_POLICY_ERROR_INVALID_CONTEXT",
-}
-
-export type BidPolicyErrorType =
-  | {
-      code: BidPolicyErrorCode.INVALID_OPTION;
-      field: BidPolicyOption;
-      value: number;
-    }
-  | {
-      code: BidPolicyErrorCode.INVALID_CONTEXT;
-      field: BidPolicyContextField;
-      value: number;
-    };
-
-export class BidPolicyError extends LodestarError<BidPolicyErrorType> {}
-
 /**
  * Offers a fixed share of the payload value, bounded by the configured limits and the
  * builder's coverable balance. Independent of competing bids.
  */
 export class ProportionalBidPolicy implements BidPolicy {
   constructor(private readonly opts: ProportionalBidPolicyOpts) {
-    assertOption(opts.shareBps, "shareBps");
+    assertValue(opts.shareBps, "shareBps");
     if (opts.shareBps > 10_000) {
-      throw invalidOption("shareBps", opts.shareBps, "must be within [0, 10000]");
+      throw Error(`Invalid shareBps=${opts.shareBps}, must be within [0, 10000]`);
     }
 
-    assertOption(opts.fixedCostGwei, "fixedCostGwei");
-    assertOption(opts.minValueGwei, "minValueGwei");
+    assertValue(opts.fixedCostGwei, "fixedCostGwei");
+    assertValue(opts.minValueGwei, "minValueGwei");
 
     if (opts.maxValueGwei !== undefined) {
-      assertOption(opts.maxValueGwei, "maxValueGwei");
+      assertValue(opts.maxValueGwei, "maxValueGwei");
       if (opts.maxValueGwei < opts.minValueGwei) {
-        throw invalidOption(
-          "maxValueGwei",
-          opts.maxValueGwei,
-          `must be greater than or equal to minValueGwei=${opts.minValueGwei}`
+        throw Error(
+          `Invalid maxValueGwei=${opts.maxValueGwei}, must be greater than or equal to minValueGwei=${opts.minValueGwei}`
         );
       }
     }
   }
 
   computeValue({payloadValueGwei, coverableGwei}: BidContext): number | null {
-    assertContext(payloadValueGwei, "payloadValueGwei");
-    assertContext(coverableGwei, "coverableGwei");
+    assertValue(payloadValueGwei, "payloadValueGwei");
+    assertValue(coverableGwei, "coverableGwei");
 
     const proportionalValue = Number((BigInt(payloadValueGwei) * BigInt(this.opts.shareBps)) / 10_000n);
     const share = proportionalValue - this.opts.fixedCostGwei;
@@ -88,24 +62,8 @@ export class ProportionalBidPolicy implements BidPolicy {
   }
 }
 
-function assertOption(value: number, field: BidPolicyOption): void {
+function assertValue(value: number, field: keyof ProportionalBidPolicyOpts | keyof BidContext): void {
   if (!Number.isSafeInteger(value) || value < 0) {
-    throw invalidOption(field, value, "must be a non-negative safe integer");
-  }
-}
-
-function invalidOption(field: BidPolicyOption, value: number, reason: string): BidPolicyError {
-  return new BidPolicyError(
-    {code: BidPolicyErrorCode.INVALID_OPTION, field, value},
-    `Invalid Bid policy option field=${field} value=${value}: ${reason}`
-  );
-}
-
-function assertContext(value: number, field: BidPolicyContextField): void {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new BidPolicyError(
-      {code: BidPolicyErrorCode.INVALID_CONTEXT, field, value},
-      `Invalid Bid policy context field=${field} value=${value}: must be a non-negative safe integer`
-    );
+    throw Error(`Invalid ${field}=${value}, must be a non-negative safe integer`);
   }
 }
