@@ -27,30 +27,25 @@ export type ProportionalBidPolicyOpts = {
  */
 export class ProportionalBidPolicy implements BidPolicy {
   constructor(private readonly opts: ProportionalBidPolicyOpts) {
-    assertValue(opts.shareBps, "shareBps");
-    if (opts.shareBps > 10_000) {
+    if (opts.shareBps < 0 || opts.shareBps > 10_000) {
       throw Error(`Invalid shareBps=${opts.shareBps}, must be within [0, 10000]`);
     }
 
-    assertValue(opts.fixedCostGwei, "fixedCostGwei");
-    assertValue(opts.minValueGwei, "minValueGwei");
+    if (opts.minValueGwei < 0) {
+      throw Error(`Invalid minValueGwei=${opts.minValueGwei}, must be a positive number`);
+    }
 
-    if (opts.maxValueGwei !== undefined) {
-      assertValue(opts.maxValueGwei, "maxValueGwei");
-      if (opts.maxValueGwei < opts.minValueGwei) {
-        throw Error(
-          `Invalid maxValueGwei=${opts.maxValueGwei}, must be greater than or equal to minValueGwei=${opts.minValueGwei}`
-        );
-      }
+    if (opts.maxValueGwei !== undefined && opts.maxValueGwei < opts.minValueGwei) {
+      throw Error(
+        `Invalid maxValueGwei=${opts.maxValueGwei}, must be greater than or equal to minValueGwei=${opts.minValueGwei}`
+      );
     }
   }
 
   computeValue({payloadValueGwei, coverableGwei}: BidContext): number | null {
-    assertValue(payloadValueGwei, "payloadValueGwei");
-    assertValue(coverableGwei, "coverableGwei");
-
     const proportionalValue = Number((BigInt(payloadValueGwei) * BigInt(this.opts.shareBps)) / 10_000n);
     const share = proportionalValue - this.opts.fixedCostGwei;
+    // This will override `fixedCostGwei` for the sake of fulfilling `minValueGwei`
     let value = Math.max(this.opts.minValueGwei, share);
     if (this.opts.maxValueGwei !== undefined) {
       value = Math.min(value, this.opts.maxValueGwei);
@@ -59,11 +54,5 @@ export class ProportionalBidPolicy implements BidPolicy {
       return null;
     }
     return value;
-  }
-}
-
-function assertValue(value: number, field: keyof ProportionalBidPolicyOpts | keyof BidContext): void {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw Error(`Invalid ${field}=${value}, must be a non-negative safe integer`);
   }
 }

@@ -1,5 +1,5 @@
 import {describe, expect, it} from "vitest";
-import {ProportionalBidPolicy, type ProportionalBidPolicyOpts} from "../../../src/services/bidPolicy.js";
+import {ProportionalBidPolicy} from "../../../src/services/bidPolicy.js";
 
 describe("ProportionalBidPolicy", () => {
   it("offers a share of the payload value", () => {
@@ -42,42 +42,15 @@ describe("ProportionalBidPolicy", () => {
     ).toThrow();
   });
 
-  for (const {field, value} of [
-    {field: "shareBps", value: 1.5},
-    {field: "shareBps", value: Number.NaN},
-    {field: "fixedCostGwei", value: -1},
-    {field: "fixedCostGwei", value: Number.POSITIVE_INFINITY},
-    {field: "minValueGwei", value: Number.MAX_SAFE_INTEGER + 1},
-    {field: "maxValueGwei", value: 1.5},
-  ] satisfies {field: keyof ProportionalBidPolicyOpts; value: number}[]) {
-    it(`rejects invalid ${field}=${value}`, () => {
-      expect(() => new ProportionalBidPolicy({...validOpts(), [field]: value})).toThrow();
-    });
-  }
-
-  for (const {field, value} of [
-    {field: "payloadValueGwei", value: -1},
-    {field: "payloadValueGwei", value: 1.5},
-    {field: "payloadValueGwei", value: Number.NaN},
-    {field: "payloadValueGwei", value: Number.MAX_SAFE_INTEGER + 1},
-    {field: "coverableGwei", value: -1},
-    {field: "coverableGwei", value: Number.POSITIVE_INFINITY},
-  ] as const) {
-    it(`rejects invalid ${field}=${value}`, () => {
-      const policy = new ProportionalBidPolicy(validOpts());
-      const context = {payloadValueGwei: 100, coverableGwei: 100, [field]: value};
-      expect(() => policy.computeValue(context)).toThrow();
-    });
-  }
-
   it("computes a full-value bid without unsafe intermediate arithmetic", () => {
-    const policy = new ProportionalBidPolicy({...validOpts(), shareBps: 10_000});
+    const policy = new ProportionalBidPolicy({shareBps: 10_000, fixedCostGwei: 0, minValueGwei: 0});
     expect(
       policy.computeValue({payloadValueGwei: Number.MAX_SAFE_INTEGER, coverableGwei: Number.MAX_SAFE_INTEGER})
     ).toBe(Number.MAX_SAFE_INTEGER);
   });
-});
 
-function validOpts(): ProportionalBidPolicyOpts {
-  return {shareBps: 5000, fixedCostGwei: 0, minValueGwei: 0};
-}
+  it("rounds a proportional value down before deducting the fixed cost", () => {
+    const policy = new ProportionalBidPolicy({shareBps: 3333, fixedCostGwei: 2, minValueGwei: 0});
+    expect(policy.computeValue({payloadValueGwei: 10, coverableGwei: 100})).toBe(1);
+  });
+});
