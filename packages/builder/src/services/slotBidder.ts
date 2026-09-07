@@ -195,7 +195,6 @@ export class SlotBidder {
 
     signal.throwIfAborted();
     const blockHash = toRootHex(payload.executionPayload.blockHash);
-    this.modules.store.add({slot: input.slot, parentBlockRoot: input.parentBlockRoot, blockHash, payload});
 
     const bid =
       matched.fork === ForkName.heze
@@ -219,6 +218,7 @@ export class SlotBidder {
             payload: matched.payload,
           });
 
+    this.modules.store.add({slot: input.slot, parentBlockRoot: input.parentBlockRoot, blockHash, payload});
     await this.modules.publisher.publish(bid, signal);
     return {
       status: "published",

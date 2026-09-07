@@ -10,6 +10,7 @@ import {BidLedger} from "../../../src/services/bidLedger.js";
 import type {BidPolicy} from "../../../src/services/bidPolicy.js";
 import {BidPublisher} from "../../../src/services/bidPublisher.js";
 import {BuilderSigner} from "../../../src/services/builderSigner.js";
+import {ExecutionPayloadBidErrorCode} from "../../../src/services/executionPayloadBid.js";
 import type {PayloadOrchestrator} from "../../../src/services/payloadOrchestrator.js";
 import type {BuiltPayload} from "../../../src/services/payloadSource.js";
 import {PayloadStore} from "../../../src/services/payloadStore.js";
@@ -228,6 +229,18 @@ describe("SlotBidder", () => {
       code: SlotBidderErrorCode.PAYLOAD_PARENT_MISMATCH,
       expectedParentBlockHash: PARENT_BLOCK_HASH,
       payloadParentBlockHash: rootHex(6),
+    });
+    expect(store.size).toBe(0);
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it("rejects a payload equal to its parent before retention or publication", async () => {
+    const payload = builtPayload(ForkName.gloas);
+    payload.executionPayload.blockHash = payload.executionPayload.parentHash.slice();
+    const {bidder, publish, store} = setup(payload);
+
+    await expect(bidder.run(gloasInput(), new AbortController().signal)).rejects.toMatchObject({
+      type: {code: ExecutionPayloadBidErrorCode.BLOCK_HASH_EQUALS_PARENT},
     });
     expect(store.size).toBe(0);
     expect(publish).not.toHaveBeenCalled();
