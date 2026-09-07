@@ -7,7 +7,7 @@ import type {RootHex, heze} from "@lodestar/types";
 import {ssz} from "@lodestar/types";
 import {toRootHex} from "@lodestar/utils";
 import {BidLedger} from "../../../src/services/bidLedger.js";
-import type {BidPolicy} from "../../../src/services/bidPolicy.js";
+import {type BidPolicy, ProportionalBidPolicy} from "../../../src/services/bidPolicy.js";
 import {BidPublisher} from "../../../src/services/bidPublisher.js";
 import {BuilderSigner} from "../../../src/services/builderSigner.js";
 import {ExecutionPayloadBidErrorCode} from "../../../src/services/executionPayloadBid.js";
@@ -125,6 +125,50 @@ describe("SlotBidder", () => {
     expect(store.size).toBe(0);
     expect(publish).not.toHaveBeenCalled();
   });
+
+  it.each([ForkName.gloas, ForkName.heze] as const)("publishes with the proportional policy in %s", async (fork) => {
+    const payload = fork === ForkName.heze ? builtPayload(ForkName.heze) : builtPayload(ForkName.gloas);
+    const {bidder, modules, publish, store} = setup(payload);
+    modules.policy = new ProportionalBidPolicy({shareBps: 5000, fixedCostGwei: 0, minValueGwei: 0});
+    const input =
+      fork === ForkName.heze ? hezeInput(ssz.heze.ExecutionPayloadBid.defaultValue().inclusionListBits) : gloasInput();
+
+    await expect(bidder.run(input, new AbortController().signal)).resolves.toEqual({
+      status: "published",
+      blockHash: BLOCK_HASH,
+      sourceId: "engine-0",
+      valueGwei: 5,
+    });
+    expect(store.get(BLOCK_HASH)).not.toBeNull();
+    expect(publish).toHaveBeenCalledOnce();
+    expect(publish.mock.calls[0][0].value).toBe(5);
+  });
+
+  it("does not retain or publish when the proportional policy minimum exceeds coverable balance", async () => {
+    const {bidder, modules, publish, store} = setup(builtPayload(ForkName.gloas));
+    modules.policy = new ProportionalBidPolicy({shareBps: 5000, fixedCostGwei: 0, minValueGwei: 101});
+
+    await expect(bidder.run(gloasInput(), new AbortController().signal)).resolves.toEqual({
+      status: "not_published",
+      reason: "policy_declined",
+    });
+    expect(store.size).toBe(0);
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it.each([Number.NaN, 0.5])(
+    "rejects an invalid proportional policy result from minValueGwei=%s",
+    async (minValueGwei) => {
+      const {bidder, modules, publish, store} = setup(builtPayload(ForkName.gloas));
+      modules.policy = new ProportionalBidPolicy({shareBps: 0, fixedCostGwei: 0, minValueGwei});
+
+      await expect(bidder.run(gloasInput(), new AbortController().signal)).rejects.toMatchObject({
+        type: {code: ExecutionPayloadBidErrorCode.INVALID_VALUE, value: minValueGwei},
+      });
+      expect(store.size).toBe(0);
+      expect(publish).not.toHaveBeenCalled();
+    }
+  );
 
   it("does not rebuild or republish a submitted variant", async () => {
     const input = gloasInput();
