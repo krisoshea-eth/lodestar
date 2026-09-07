@@ -192,6 +192,56 @@ describe("SlotBidder", () => {
     expect(publish).not.toHaveBeenCalled();
   });
 
+  describe.each([ForkName.gloas, ForkName.heze] as const)("%s coverability", (fork) => {
+    it.each([
+      {reserve: 0, unsettled: 0, coverable: 100},
+      {reserve: 25, unsettled: 40, coverable: 35},
+      {reserve: 0, unsettled: 100, coverable: 0},
+    ])(
+      "enforces the policy limit with reserve $reserve and unsettled $unsettled",
+      async ({reserve, unsettled, coverable}) => {
+        const ledger = new BidLedger();
+        const prior = {
+          slot: SLOT,
+          parentBlockHash: rootHex(6),
+          parentBlockRoot: rootHex(7),
+          blockHash: rootHex(8),
+          signedBidRoot: rootHex(5),
+        };
+        ledger.recordBid({...prior, valueGwei: unsettled});
+        ledger.recordWin(prior, rootHex(9));
+        const payload = fork === ForkName.heze ? builtPayload(ForkName.heze) : builtPayload(ForkName.gloas);
+        const input =
+          fork === ForkName.heze
+            ? hezeInput(ssz.heze.ExecutionPayloadBid.defaultValue().inclusionListBits)
+            : gloasInput();
+        const {bidder, modules, publish, store} = setup(payload, {
+          ledger,
+          minOperatingBalanceGwei: MIN_DEPOSIT_AMOUNT + reserve,
+          policyValue: coverable + 1,
+        });
+        const add = vi.spyOn(store, "add");
+
+        await expectSlotBidderError(bidder.run(input, new AbortController().signal), {
+          code: SlotBidderErrorCode.UNCOVERED_BID,
+          valueGwei: coverable + 1,
+          coverableGwei: coverable,
+        });
+        expect(add).not.toHaveBeenCalled();
+        expect(publish).not.toHaveBeenCalled();
+        expect(ledger.hasSubmitted(input.slot, PARENT_BLOCK_HASH, toRootHex(PARENT_BLOCK_ROOT))).toBe(false);
+
+        vi.mocked(modules.policy.computeValue).mockReturnValue(coverable);
+        await expect(bidder.run(input, new AbortController().signal)).resolves.toMatchObject({
+          status: "published",
+          valueGwei: coverable,
+        });
+        expect(add).toHaveBeenCalledOnce();
+        expect(publish).toHaveBeenCalledOnce();
+      }
+    );
+  });
+
   it("publishes only once when duplicate calls share an in-flight build", async () => {
     const input = gloasInput();
     const {bidder, publish} = setup(builtPayload(ForkName.gloas));

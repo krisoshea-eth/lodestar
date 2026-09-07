@@ -73,6 +73,7 @@ export enum SlotBidderErrorCode {
   PAYLOAD_PARENT_MISMATCH = "SLOT_BIDDER_ERROR_PAYLOAD_PARENT_MISMATCH",
   INVALID_BUILDER_BALANCE = "SLOT_BIDDER_ERROR_INVALID_BUILDER_BALANCE",
   UNSAFE_PAYLOAD_VALUE = "SLOT_BIDDER_ERROR_UNSAFE_PAYLOAD_VALUE",
+  UNCOVERED_BID = "SLOT_BIDDER_ERROR_UNCOVERED_BID",
 }
 
 export type SlotBidderErrorType =
@@ -114,6 +115,11 @@ export type SlotBidderErrorType =
   | {
       code: SlotBidderErrorCode.UNSAFE_PAYLOAD_VALUE;
       executionPayloadValue: bigint;
+    }
+  | {
+      code: SlotBidderErrorCode.UNCOVERED_BID;
+      valueGwei: number;
+      coverableGwei: number;
     };
 
 export class SlotBidderError extends LodestarError<SlotBidderErrorType> {}
@@ -217,6 +223,13 @@ export class SlotBidder {
             value: valueGwei,
             payload: matched.payload,
           });
+
+    if (valueGwei > coverableGwei) {
+      throw new SlotBidderError(
+        {code: SlotBidderErrorCode.UNCOVERED_BID, valueGwei, coverableGwei},
+        `Bid exceeds available Builder balance valueGwei=${valueGwei} coverableGwei=${coverableGwei}`
+      );
+    }
 
     this.modules.store.add({slot: input.slot, parentBlockRoot: input.parentBlockRoot, blockHash, payload});
     await this.modules.publisher.publish(bid, signal);
