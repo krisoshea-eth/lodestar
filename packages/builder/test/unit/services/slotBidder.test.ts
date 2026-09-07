@@ -14,6 +14,7 @@ import {ExecutionPayloadBidErrorCode} from "../../../src/services/executionPaylo
 import type {PayloadOrchestrator} from "../../../src/services/payloadOrchestrator.js";
 import type {BuiltPayload} from "../../../src/services/payloadSource.js";
 import {PayloadStore} from "../../../src/services/payloadStore.js";
+import {ProposerPreferencesTracker} from "../../../src/services/proposerPreferencesTracker.js";
 import {
   type GloasSlotBidInput,
   type HezeSlotBidInput,
@@ -31,6 +32,31 @@ const BLOCK_HASH = toRootHex(Buffer.alloc(32, 3));
 const FEE_RECIPIENT = Buffer.alloc(20, 4);
 
 describe("SlotBidder", () => {
+  it("uses retained proposer preferences despite mutations to the event and an earlier lookup", async () => {
+    const tracker = new ProposerPreferencesTracker();
+    const signed = ssz.gloas.SignedProposerPreferences.defaultValue();
+    signed.message.proposalSlot = SLOT;
+    signed.message.dependentRoot = Buffer.alloc(32, 5);
+    signed.message.feeRecipient = Buffer.from(FEE_RECIPIENT);
+    const dependentRoot = toRootHex(signed.message.dependentRoot);
+    tracker.onProposerPreferences(signed);
+    signed.message.feeRecipient.fill(8);
+
+    const earlierRead = tracker.get(SLOT, dependentRoot);
+    if (earlierRead === null) throw Error("Expected retained preferences");
+    earlierRead.message.feeRecipient.fill(9);
+
+    const preferences = tracker.get(SLOT, dependentRoot);
+    if (preferences === null) throw Error("Expected retained preferences");
+    const input = {...gloasInput(), proposerFeeRecipient: preferences.message.feeRecipient};
+    const {bidder, publish} = setup(builtPayload(ForkName.gloas));
+
+    await bidder.run(input, new AbortController().signal);
+
+    expect(publish).toHaveBeenCalledOnce();
+    expect(publish.mock.calls[0][0].feeRecipient).toEqual(Uint8Array.from(FEE_RECIPIENT));
+  });
+
   it.each([-1n, -999_999_999n, -1_000_000_000n, (BigInt(Number.MAX_SAFE_INTEGER) + 1n) * 1_000_000_000n])(
     "rejects invalid payload value %s before policy or retention",
     async (executionPayloadValue) => {
