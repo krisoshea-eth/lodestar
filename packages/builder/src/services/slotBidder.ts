@@ -8,7 +8,7 @@ import type {BidPublisher} from "./bidPublisher.js";
 import {createExecutionPayloadBid} from "./executionPayloadBid.js";
 import type {PayloadBuildJob, PayloadOrchestrator} from "./payloadOrchestrator.js";
 import type {BuildRequest, BuiltPayload} from "./payloadSource.js";
-import type {PayloadStore} from "./payloadStore.js";
+import type {StoredPayload} from "./payloadStore.js";
 
 const WEI_PER_GWEI = 1_000_000_000n;
 
@@ -45,7 +45,7 @@ type MatchedSlotBidInput =
 
 export type SlotBidderModules = {
   orchestrator: Pick<PayloadOrchestrator, "run">;
-  store: Pick<PayloadStore, "add">;
+  store: {add(payload: StoredPayload): void};
   policy: BidPolicy;
   ledger: Pick<BidLedger, "getUnsettledValueGwei" | "hasSubmitted">;
   publisher: Pick<BidPublisher, "publish">;
@@ -169,17 +169,20 @@ export class SlotBidder {
       return {status: "not_published", reason: "low_balance"};
     }
 
-    const payloadValueGweiBigint = payload.executionPayloadValue / WEI_PER_GWEI;
-    if (payloadValueGweiBigint < 0n || payloadValueGweiBigint > BigInt(Number.MAX_SAFE_INTEGER)) {
+    if (
+      payload.executionPayloadValue < 0n ||
+      payload.executionPayloadValue / WEI_PER_GWEI > BigInt(Number.MAX_SAFE_INTEGER)
+    ) {
       throw new SlotBidderError(
         {
           code: SlotBidderErrorCode.UNSAFE_PAYLOAD_VALUE,
           executionPayloadValue: payload.executionPayloadValue,
         },
-        `Execution payload value exceeds the safe Gwei range executionPayloadValue=${payload.executionPayloadValue}`
+        `Execution payload value is outside the non-negative safe Gwei range executionPayloadValue=${payload.executionPayloadValue}`
       );
     }
 
+    const payloadValueGweiBigint = payload.executionPayloadValue / WEI_PER_GWEI;
     const unsettledValueGwei = this.modules.ledger.getUnsettledValueGwei(computeEpochAtSlot(input.slot));
     const coverableGwei = Math.max(balance - this.options.minOperatingBalanceGwei - unsettledValueGwei, 0);
     const valueGwei = this.modules.policy.computeValue({
@@ -191,7 +194,8 @@ export class SlotBidder {
     }
 
     signal.throwIfAborted();
-    this.modules.store.add({slot: input.slot, parentBlockRoot: input.parentBlockRoot, payload});
+    const blockHash = toRootHex(payload.executionPayload.blockHash);
+    this.modules.store.add({slot: input.slot, parentBlockRoot: input.parentBlockRoot, blockHash, payload});
 
     const bid =
       matched.fork === ForkName.heze
@@ -218,7 +222,7 @@ export class SlotBidder {
     await this.modules.publisher.publish(bid, signal);
     return {
       status: "published",
-      blockHash: toRootHex(payload.executionPayload.blockHash),
+      blockHash,
       sourceId: payload.sourceId,
       valueGwei,
     };

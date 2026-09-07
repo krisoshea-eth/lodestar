@@ -1,11 +1,15 @@
 import {describe, expect, it, vi} from "vitest";
+import {SecretKey} from "@chainsafe/lodestar-z/blst";
+import {createBeaconConfig} from "@lodestar/config";
+import {getConfig} from "@lodestar/config/test-utils";
 import {ForkName, MIN_DEPOSIT_AMOUNT} from "@lodestar/params";
 import type {RootHex, heze} from "@lodestar/types";
 import {ssz} from "@lodestar/types";
 import {toRootHex} from "@lodestar/utils";
 import {BidLedger} from "../../../src/services/bidLedger.js";
 import type {BidPolicy} from "../../../src/services/bidPolicy.js";
-import type {BidPublisher} from "../../../src/services/bidPublisher.js";
+import {BidPublisher} from "../../../src/services/bidPublisher.js";
+import {BuilderSigner} from "../../../src/services/builderSigner.js";
 import type {PayloadOrchestrator} from "../../../src/services/payloadOrchestrator.js";
 import type {BuiltPayload} from "../../../src/services/payloadSource.js";
 import {PayloadStore} from "../../../src/services/payloadStore.js";
@@ -17,6 +21,7 @@ import {
   SlotBidderErrorCode,
   type SlotBidderModules,
 } from "../../../src/services/slotBidder.js";
+import {getApiClientStub, mockApiResponse} from "../utils/apiStub.js";
 
 const SLOT = 64;
 const PARENT_BLOCK_ROOT = Buffer.alloc(32, 1);
@@ -25,9 +30,42 @@ const BLOCK_HASH = toRootHex(Buffer.alloc(32, 3));
 const FEE_RECIPIENT = Buffer.alloc(20, 4);
 
 describe("SlotBidder", () => {
+  it.each([-1n, -999_999_999n, -1_000_000_000n, (BigInt(Number.MAX_SAFE_INTEGER) + 1n) * 1_000_000_000n])(
+    "rejects invalid payload value %s before policy or retention",
+    async (executionPayloadValue) => {
+      const payload = builtPayload(ForkName.gloas);
+      payload.executionPayloadValue = executionPayloadValue;
+      const {bidder, modules, publish, store} = setup(payload);
+
+      await expectSlotBidderError(bidder.run(gloasInput(), new AbortController().signal), {
+        code: SlotBidderErrorCode.UNSAFE_PAYLOAD_VALUE,
+        executionPayloadValue,
+      });
+      expect(modules.policy.computeValue).not.toHaveBeenCalled();
+      expect(store.size).toBe(0);
+      expect(publish).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([
+    [0n, 0],
+    [1n, 0],
+    [999_999_999n, 0],
+    [1_000_000_000n, 1],
+    [BigInt(Number.MAX_SAFE_INTEGER) * 1_000_000_000n + 999_999_999n, Number.MAX_SAFE_INTEGER],
+  ] as const)("converts valid payload value %s to %s Gwei", async (executionPayloadValue, payloadValueGwei) => {
+    const payload = builtPayload(ForkName.gloas);
+    payload.executionPayloadValue = executionPayloadValue;
+    const {bidder, modules} = setup(payload);
+
+    await bidder.run(gloasInput(), new AbortController().signal);
+    expect(modules.policy.computeValue).toHaveBeenCalledWith({payloadValueGwei, coverableGwei: 100});
+  });
+
   it("builds, retains, and publishes one Gloas bid", async () => {
     const payload = builtPayload(ForkName.gloas);
     const {bidder, modules, publish, store} = setup(payload);
+    const add = vi.spyOn(store, "add");
 
     const result = await bidder.run(gloasInput(), new AbortController().signal);
 
@@ -35,6 +73,7 @@ describe("SlotBidder", () => {
     expect(modules.orchestrator.run).toHaveBeenCalledOnce();
     expect(modules.policy.computeValue).toHaveBeenCalledWith({payloadValueGwei: 10, coverableGwei: 100});
     expect(store.get(BLOCK_HASH)?.payload).toBe(payload);
+    expect(add).toHaveBeenCalledWith({slot: SLOT, parentBlockRoot: PARENT_BLOCK_ROOT, blockHash: BLOCK_HASH, payload});
     expect(publish).toHaveBeenCalledOnce();
     expect(publish.mock.calls[0][0]).toMatchObject({
       slot: SLOT,
@@ -95,6 +134,7 @@ describe("SlotBidder", () => {
       parentBlockRoot: toRootHex(input.parentBlockRoot),
       blockHash: BLOCK_HASH,
       valueGwei: 7,
+      signedBidRoot: rootHex(5),
     });
     const {bidder, modules, publish, store} = setup(builtPayload(ForkName.gloas), {ledger});
 
@@ -125,7 +165,13 @@ describe("SlotBidder", () => {
 
   it("subtracts unsettled wins from coverable balance", async () => {
     const ledger = new BidLedger();
-    const prior = {slot: SLOT, parentBlockHash: rootHex(6), parentBlockRoot: rootHex(7), blockHash: rootHex(8)};
+    const prior = {
+      slot: SLOT,
+      parentBlockHash: rootHex(6),
+      parentBlockRoot: rootHex(7),
+      blockHash: rootHex(8),
+      signedBidRoot: rootHex(5),
+    };
     ledger.recordBid({...prior, valueGwei: 40});
     ledger.recordWin(prior, rootHex(9));
     const {bidder, modules} = setup(builtPayload(ForkName.gloas), {ledger});
@@ -279,25 +325,27 @@ function setupModules(
       .mockReturnValue(opts.policyValue === undefined ? 7 : opts.policyValue),
   };
   const ledger = opts.ledger ?? new BidLedger();
-  const publish = vi.fn<BidPublisher["publish"]>().mockImplementation(async (bid) => {
-    expect(store.get(toRootHex(bid.blockHash))).not.toBeNull();
-    ledger.recordBid({
-      slot: bid.slot,
-      parentBlockHash: toRootHex(bid.parentBlockHash),
-      parentBlockRoot: toRootHex(bid.parentBlockRoot),
-      blockHash: toRootHex(bid.blockHash),
-      valueGwei: bid.value,
-    });
-    const signed = ssz.gloas.SignedExecutionPayloadBid.defaultValue();
-    signed.message = bid;
-    return signed;
+  const api = getApiClientStub();
+  Object.assign(api.beacon, {publishExecutionPayloadBid: vi.fn()});
+  const config = createBeaconConfig(getConfig(payload.fork), Buffer.alloc(32, 1));
+  const secretKey = SecretKey.fromBytes(Buffer.alloc(32, 2));
+  const signer = new BuilderSigner(config, {secretKey, publicKey: secretKey.toPublicKey()});
+  api.beacon.publishExecutionPayloadBid.mockResolvedValue(mockApiResponse({}));
+  const publisher = new BidPublisher({
+    api,
+    config,
+    signer,
+    ledger,
+    builderIndex: 9,
+    hasPayload: (identity) => store.get(identity.blockHash) !== null,
   });
+  const publish = vi.spyOn(publisher, "publish");
   const modules: SlotBidderModules = {
     orchestrator,
     store,
     policy,
     ledger,
-    publisher: {publish},
+    publisher,
     getBuilderStatus: () => opts.builderStatus ?? {status: "active", balance: MIN_DEPOSIT_AMOUNT + 100},
     builderIndex: 9,
   };
