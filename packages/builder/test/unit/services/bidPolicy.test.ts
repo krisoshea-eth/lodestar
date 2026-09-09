@@ -53,4 +53,8 @@ describe("ProportionalBidPolicy", () => {
     const policy = new ProportionalBidPolicy({shareBps: 3333, fixedCostGwei: 2, minValueGwei: 0});
     expect(policy.computeValue({payloadValueGwei: 10, coverableGwei: 100})).toBe(1);
   });
+
+  it.each([12.5, NaN, Infinity, -Infinity])("rejects an invalid shareBps %s at construction", (shareBps) => {
+    expect(() => new ProportionalBidPolicy({shareBps, fixedCostGwei: 2, minValueGwei: 0})).toThrow();
+  });
 });
