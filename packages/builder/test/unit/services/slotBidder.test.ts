@@ -189,19 +189,15 @@ describe("SlotBidder", () => {
     expect(publish).not.toHaveBeenCalled();
   });
 
-  it.each([Number.NaN, 0.5])(
-    "rejects an invalid proportional policy result from minValueGwei=%s",
-    async (minValueGwei) => {
-      const {bidder, modules, publish, store} = setup(builtPayload(ForkName.gloas));
-      modules.policy = new ProportionalBidPolicy({shareBps: 0, fixedCostGwei: 0, minValueGwei});
+  it.each([Number.NaN, 0.5])("rejects an invalid injected policy result %s", async (policyValue) => {
+    const {bidder, publish, store} = setup(builtPayload(ForkName.gloas), {policyValue});
 
-      await expect(bidder.run(gloasInput(), new AbortController().signal)).rejects.toMatchObject({
-        type: {code: ExecutionPayloadBidErrorCode.INVALID_VALUE, value: minValueGwei},
-      });
-      expect(store.size).toBe(0);
-      expect(publish).not.toHaveBeenCalled();
-    }
-  );
+    await expect(bidder.run(gloasInput(), new AbortController().signal)).rejects.toMatchObject({
+      type: {code: ExecutionPayloadBidErrorCode.INVALID_VALUE, value: policyValue},
+    });
+    expect(store.size).toBe(0);
+    expect(publish).not.toHaveBeenCalled();
+  });
 
   it("does not rebuild or republish a submitted variant", async () => {
     const input = gloasInput();
