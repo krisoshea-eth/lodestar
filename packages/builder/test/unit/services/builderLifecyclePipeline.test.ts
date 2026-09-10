@@ -30,7 +30,8 @@ describe("Builder lifecycle component pipeline", () => {
       const payload = createBuiltPayload();
       const blockHash = toRootHex(payload.executionPayload.blockHash);
       const store = new PayloadStore();
-      store.add({slot, parentBlockRoot, payload});
+      const storedPayload = {slot, parentBlockRoot, blockHash, payload};
+      store.add(storedPayload);
 
       const bid = createExecutionPayloadBid({
         fork: ForkName.gloas,
