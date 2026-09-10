@@ -1,7 +1,7 @@
 import {ForkName, MIN_DEPOSIT_AMOUNT} from "@lodestar/params";
 import {computeEpochAtSlot} from "@lodestar/state-transition";
 import type {BuilderIndex, BuilderStatus, ExecutionAddress, Root, RootHex, Slot, heze} from "@lodestar/types";
-import {LodestarError, toRootHex} from "@lodestar/utils";
+import {GWEI_TO_WEI, LodestarError, toRootHex} from "@lodestar/utils";
 import type {BidLedger} from "./bidLedger.js";
 import type {BidPolicy} from "./bidPolicy.js";
 import type {BidPublisher} from "./bidPublisher.js";
@@ -9,8 +9,6 @@ import {createExecutionPayloadBid} from "./executionPayloadBid.js";
 import type {PayloadBuildJob, PayloadOrchestrator} from "./payloadOrchestrator.js";
 import type {BuildRequest, BuiltPayload} from "./payloadSource.js";
 import type {StoredPayload} from "./payloadStore.js";
-
-const WEI_PER_GWEI = 1_000_000_000n;
 
 function isBuiltPayloadFor<F extends ForkName.gloas | ForkName.heze>(
   payload: BuiltPayload,
@@ -177,7 +175,7 @@ export class SlotBidder {
 
     if (
       payload.executionPayloadValue < 0n ||
-      payload.executionPayloadValue / WEI_PER_GWEI > BigInt(Number.MAX_SAFE_INTEGER)
+      payload.executionPayloadValue / GWEI_TO_WEI > BigInt(Number.MAX_SAFE_INTEGER)
     ) {
       throw new SlotBidderError(
         {
@@ -188,7 +186,7 @@ export class SlotBidder {
       );
     }
 
-    const payloadValueGweiBigint = payload.executionPayloadValue / WEI_PER_GWEI;
+    const payloadValueGweiBigint = payload.executionPayloadValue / GWEI_TO_WEI;
     const unsettledValueGwei = this.modules.ledger.getUnsettledValueGwei(computeEpochAtSlot(input.slot));
     const coverableGwei = Math.max(balance - this.options.minOperatingBalanceGwei - unsettledValueGwei, 0);
     const valueGwei = this.modules.policy.computeValue({
