@@ -861,6 +861,12 @@ export function getPayloadAttributesForSSE(
     proposalSlot: prepareSlot,
     parentBlockRoot,
     parentBlockHash,
+    ...(isForkPostGloas(fork)
+      ? {
+          safeBlockHash: fromHex(getSafeExecutionBlockHash(chain.forkChoice)),
+          finalizedBlockHash: fromHex(getFinalizedExecutionBlockHash(chain.forkChoice)),
+        }
+      : {}),
     payloadAttributes,
   } as SSEPayloadAttributes;
 
