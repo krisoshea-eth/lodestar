@@ -122,7 +122,7 @@ export type SlotBidderErrorType =
 
 export class SlotBidderError extends LodestarError<SlotBidderErrorType> {}
 
-/** Coordinates one fully resolved payload-build input through retention and one-shot bid publication. */
+/** Coordinates a resolved payload-build input through retention and bid publication. */
 export class SlotBidder {
   constructor(
     private readonly modules: SlotBidderModules,
