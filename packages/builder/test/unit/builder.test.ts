@@ -3,15 +3,19 @@ import {SecretKey} from "@chainsafe/lodestar-z/blst";
 import {routes} from "@lodestar/api";
 import {createBeaconConfig} from "@lodestar/config";
 import {getConfig} from "@lodestar/config/test-utils";
-import {ForkName} from "@lodestar/params";
+import {ForkName, MIN_DEPOSIT_AMOUNT} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
 import {ErrorAborted, defer, toRootHex} from "@lodestar/utils";
 import {Builder, BuilderModules} from "../../src/builder.js";
+import {BidLedger} from "../../src/services/bidLedger.js";
+import {BidPublisher} from "../../src/services/bidPublisher.js";
 import {BlockObserver, ObservedBlock} from "../../src/services/blockObserver.js";
 import {BuilderSigner} from "../../src/services/builderSigner.js";
 import {BuilderStatusTracker} from "../../src/services/builderStatusTracker.js";
+import {PayloadAttributesConsumer} from "../../src/services/payloadAttributesConsumer.js";
 import {PayloadStore} from "../../src/services/payloadStore.js";
 import {ProposerPreferencesTracker} from "../../src/services/proposerPreferencesTracker.js";
+import {SlotBidder} from "../../src/services/slotBidder.js";
 import {getApiClientStub, mockApiResponse} from "./utils/apiStub.js";
 import {ClockMock} from "./utils/clock.js";
 import {getMockedLogger} from "./utils/logger.js";
@@ -283,4 +287,151 @@ describe("Builder", () => {
     expect(logger.warn).not.toHaveBeenCalled();
     expect(logger.error).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["head", "attributes", "preference"],
+    ["head", "preference", "attributes"],
+    ["attributes", "head", "preference"],
+    ["attributes", "preference", "head"],
+    ["preference", "head", "attributes"],
+    ["preference", "attributes", "head"],
+  ] as const)("dispatches inputs in %s/%s/%s order", async (...order) => {
+    const {events, run} = configureInputs(modules, clock);
+    const builder = new Builder(modules);
+    const subscription = api.events.eventstream.mock.calls[0][0];
+    expect(subscription.topics).toEqual([...topics, EventType.headV2, EventType.payloadAttributes]);
+    for (const key of order) subscription.onEvent(events[key]);
+    await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
+    subscription.onEvent(events.attributes);
+    await builder.close();
+    subscription.onEvent(events.attributes);
+    expect(run).toHaveBeenCalledOnce();
+    expect(api.events.eventstream).toHaveBeenCalledOnce();
+  });
+
+  it("drives the real bid services from the Builder subscription", async () => {
+    const {events, run, config, data} = configureInputs(modules, clock);
+    const payload = mockBuiltPayload({
+      slot: data.proposalSlot,
+      parentHash: data.parentBlockHash,
+      prevRandao: data.payloadAttributes.prevRandao,
+      valueGwei: 10,
+    });
+    const ledger = new BidLedger();
+    Object.assign(api.beacon, {
+      publishExecutionPayloadBid: vi.fn().mockResolvedValue(mockApiResponse({data: undefined, meta: undefined})),
+    });
+    const publisher = new BidPublisher({
+      api,
+      config,
+      signer: modules.builderSigner,
+      ledger,
+      builderIndex: modules.index,
+      hasPayload: (identity) => modules.payloadStore.has(identity.blockHash),
+    });
+    const bidder = new SlotBidder(
+      {
+        orchestrator: {run: vi.fn().mockResolvedValue(payload)},
+        store: modules.payloadStore,
+        policy: {computeValue: () => 1},
+        ledger,
+        publisher,
+        builderIndex: modules.index,
+        getBuilderStatus: () => ({status: "active", balance: MIN_DEPOSIT_AMOUNT + 100}),
+      },
+      {minOperatingBalanceGwei: MIN_DEPOSIT_AMOUNT}
+    );
+    run.mockImplementation((input, signal) => bidder.run(input, signal));
+    const builder = new Builder(modules);
+    const {onEvent} = api.events.eventstream.mock.calls[0][0];
+    onEvent(events.head);
+    onEvent(events.attributes);
+    expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
+    onEvent(events.preference);
+
+    await vi.waitFor(() => expect(api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce());
+    expect(modules.payloadStore.has(toRootHex(payload.executionPayload.blockHash))).toBe(true);
+    expect(ledger.getBidsForSlot(data.proposalSlot)).toHaveLength(1);
+    expect(logger.warn).not.toHaveBeenCalled();
+    await builder.close();
+  });
+
+  it.each(["slot", "shutdown"])("cancels input work on %s without logging a late result", async (cause) => {
+    const {events, run} = configureInputs(modules, clock);
+    const pending = defer<Awaited<ReturnType<SlotBidder["run"]>>>();
+    run.mockReturnValue(pending.promise);
+    const builder = new Builder(modules);
+    const {onEvent} = api.events.eventstream.mock.calls[0][0];
+    onEvent(events.preference);
+    onEvent(events.head);
+    onEvent(events.attributes);
+    expect(run).toHaveBeenCalledOnce();
+    const signal = run.mock.calls[0][1];
+    if (cause === "slot") {
+      clock.currentSlot++;
+      await clock.tickSlotFns(clock.currentSlot, controller.signal);
+    } else {
+      await builder.close();
+    }
+    expect(signal.aborted).toBe(true);
+    pending.resolve({status: "not_published", reason: "policy_declined"});
+    await pending.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(logger.warn).not.toHaveBeenCalled();
+    expect(logger.error).not.toHaveBeenCalled();
+    await builder.close();
+  });
 });
+
+function configureInputs(modules: BuilderModules, clock: ClockMock) {
+  const config = createBeaconConfig(modules.opts.config, Buffer.alloc(32));
+  clock.currentSlot = 9;
+  const data = ssz.gloas.SSEPayloadAttributes.defaultValue();
+  data.proposalSlot = 10;
+  data.proposerIndex = 7;
+  data.parentBlockRoot = Buffer.alloc(32, 2);
+  data.parentBlockHash = Buffer.alloc(32, 3);
+  data.safeBlockHash = Buffer.alloc(32, 4);
+  data.finalizedBlockHash = Buffer.alloc(32, 5);
+  data.payloadAttributes.slotNumber = data.proposalSlot;
+  data.payloadAttributes.parentBeaconBlockRoot = data.parentBlockRoot;
+  data.payloadAttributes.timestamp = (data.proposalSlot * config.SLOT_DURATION_MS) / 1000;
+  data.payloadAttributes.targetGasLimit = 30_000_000n;
+  const preference = ssz.gloas.SignedProposerPreferences.defaultValue();
+  preference.message.proposalSlot = data.proposalSlot;
+  preference.message.validatorIndex = data.proposerIndex;
+  preference.message.targetGasLimit = data.payloadAttributes.targetGasLimit;
+  preference.message.dependentRoot = Buffer.alloc(32, 6);
+  preference.message.feeRecipient = Buffer.alloc(20, 8);
+  const events = {
+    preference: {type: EventType.proposerPreferences, message: {version: ForkName.gloas, data: preference}},
+    attributes: {type: EventType.payloadAttributes, message: {version: ForkName.gloas, data}},
+    head: {
+      type: EventType.headV2,
+      message: {
+        version: ForkName.gloas,
+        data: {
+          slot: 9,
+          block: toRootHex(data.parentBlockRoot),
+          state: toRootHex(Buffer.alloc(32)),
+          payloadStatus: "full",
+          epochTransition: false,
+          currentEpochDependentRoot: toRootHex(preference.message.dependentRoot),
+          nextEpochDependentRoot: toRootHex(Buffer.alloc(32, 7)),
+          executionOptimistic: false,
+        },
+      },
+    },
+  } satisfies Record<string, routes.events.BeaconEvent>;
+  const run = vi.fn<SlotBidder["run"]>().mockResolvedValue({status: "not_published", reason: "policy_declined"});
+  modules.payloadAttributesConsumer = new PayloadAttributesConsumer(
+    {config, clock, preferences: modules.proposerPreferencesTracker, bidder: {run}},
+    {
+      executionFeeRecipient: modules.opts.executionFeeRecipient,
+      custodyColumns: [0, 3],
+      deadlineBps: 9000,
+      maxInputsPerSlot: 2,
+    }
+  );
+  return {config, data, events, run};
+}

@@ -10,6 +10,7 @@ import {logNodeVersion, waitForNodeReady} from "./readiness.js";
 import {BlockObserver} from "./services/blockObserver.js";
 import {BuilderSigner, Keypair} from "./services/builderSigner.js";
 import {BuilderStatusTracker} from "./services/builderStatusTracker.js";
+import type {PayloadAttributesConsumer} from "./services/payloadAttributesConsumer.js";
 import {PayloadStore} from "./services/payloadStore.js";
 import {ProposerPreferencesTracker} from "./services/proposerPreferencesTracker.js";
 
@@ -22,6 +23,7 @@ export type BuilderModules = {
   clock: IClock;
   index: BuilderIndex;
   payloadStore: PayloadStore;
+  payloadAttributesConsumer?: PayloadAttributesConsumer;
 };
 
 export type BuilderOptions = {
@@ -49,6 +51,7 @@ export class Builder {
   private readonly logger: Logger;
   private readonly executionFeeRecipient: ExecutionAddress;
   private readonly payloadStore: PayloadStore;
+  private readonly payloadAttributesConsumer: PayloadAttributesConsumer | undefined;
 
   constructor({
     opts,
@@ -59,6 +62,7 @@ export class Builder {
     clock,
     index,
     payloadStore,
+    payloadAttributesConsumer,
   }: BuilderModules) {
     this.builderSigner = builderSigner;
     this.blockObserver = blockObserver;
@@ -69,6 +73,7 @@ export class Builder {
     this.logger = opts.logger;
     this.index = index;
     this.payloadStore = payloadStore;
+    this.payloadAttributesConsumer = payloadAttributesConsumer;
 
     this.executionFeeRecipient = opts.executionFeeRecipient;
 
@@ -130,6 +135,7 @@ export class Builder {
   }
 
   private async onSlot(slot: number): Promise<void> {
+    this.payloadAttributesConsumer?.onSlot(slot);
     this.payloadStore.prune(slot);
     this.proposerPreferencesTracker.prune(slot);
   }
@@ -139,6 +145,9 @@ export class Builder {
     if (signal.aborted) return;
 
     const topics = [routes.events.EventType.block, routes.events.EventType.proposerPreferences];
+    if (this.payloadAttributesConsumer) {
+      topics.push(routes.events.EventType.headV2, routes.events.EventType.payloadAttributes);
+    }
     this.logger.verbose("Subscribing to builder events", {topics: topics.join(",")});
     api.events
       .eventstream({
@@ -180,6 +189,11 @@ export class Builder {
           break;
         case routes.events.EventType.proposerPreferences:
           this.proposerPreferencesTracker.onProposerPreferences(event.message.data);
+          await this.payloadAttributesConsumer?.onEvent(event, signal);
+          break;
+        case routes.events.EventType.headV2:
+        case routes.events.EventType.payloadAttributes:
+          await this.payloadAttributesConsumer?.onEvent(event, signal);
           break;
       }
     } catch (error) {
@@ -195,5 +209,6 @@ export class Builder {
 
   async close(): Promise<void> {
     this.controller.abort();
+    this.payloadAttributesConsumer?.close();
   }
 }

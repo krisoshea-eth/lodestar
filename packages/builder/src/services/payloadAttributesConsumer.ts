@@ -3,7 +3,7 @@ import type {ChainForkConfig} from "@lodestar/config";
 import {ForkName, NUMBER_OF_COLUMNS} from "@lodestar/params";
 import {type IClock, computeEpochAtSlot, computeTimeAtSlot} from "@lodestar/state-transition";
 import {type ColumnIndex, type ExecutionAddress, type gloas, ssz} from "@lodestar/types";
-import {LodestarError, toHex, toRootHex} from "@lodestar/utils";
+import {ErrorAborted, LodestarError, toHex, toRootHex} from "@lodestar/utils";
 import type {ProposerPreferencesTracker} from "./proposerPreferencesTracker.js";
 import type {SlotBidResult, SlotBidder} from "./slotBidder.js";
 
@@ -65,7 +65,8 @@ export class PayloadAttributesConsumer {
       if (this.modules.config.getForkName(data.slot) !== version || data.slot > this.slot) {
         return {status: "ignored", reason: "invalid_head"};
       }
-      if (this.head?.block !== data.block) this.active?.controller.abort();
+      if (this.head?.block !== data.block)
+        this.active?.controller.abort(new ErrorAborted("Payload input head changed"));
       this.head = {...data};
     } else if (event.type === routes.events.EventType.payloadAttributes) {
       const {version, data} = event.message;
@@ -96,7 +97,7 @@ export class PayloadAttributesConsumer {
 
   onSlot(slot: number): void {
     if (slot === this.slot) return;
-    this.active?.controller.abort();
+    this.active?.controller.abort(new ErrorAborted("Payload input slot changed"));
     this.active = undefined;
     this.pending = undefined;
     this.seen.clear();
@@ -105,7 +106,7 @@ export class PayloadAttributesConsumer {
 
   close(): void {
     this.closed = true;
-    this.active?.controller.abort();
+    this.active?.controller.abort(new ErrorAborted("Payload input consumer closed"));
     this.active = undefined;
     this.pending = undefined;
     this.head = undefined;
@@ -144,7 +145,7 @@ export class PayloadAttributesConsumer {
     if (this.seen.has(id)) return {status: "ignored", reason: "duplicate_input"};
     if (this.seen.size >= this.options.maxInputsPerSlot) return {status: "ignored", reason: "input_limit"};
 
-    this.active?.controller.abort();
+    this.active?.controller.abort(new ErrorAborted("Payload input replaced"));
     const controller = new AbortController();
     const jobSignal = AbortSignal.any([signal, controller.signal]);
     const payloadAttributes = ssz.gloas.PayloadAttributes.clone(data.payloadAttributes);

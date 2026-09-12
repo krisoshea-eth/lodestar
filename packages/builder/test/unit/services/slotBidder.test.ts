@@ -1,6 +1,5 @@
 import {describe, expect, it, vi} from "vitest";
 import {SecretKey} from "@chainsafe/lodestar-z/blst";
-import {routes} from "@lodestar/api";
 import {createBeaconConfig} from "@lodestar/config";
 import {getConfig} from "@lodestar/config/test-utils";
 import {ForkName, MIN_DEPOSIT_AMOUNT} from "@lodestar/params";
@@ -25,7 +24,6 @@ import {
   type SlotBidderModules,
 } from "../../../src/services/slotBidder.js";
 import {getApiClientStub, mockApiResponse} from "../utils/apiStub.js";
-import {getMockedLogger} from "../utils/logger.js";
 
 const SLOT = 64;
 const PARENT_BLOCK_ROOT = Buffer.alloc(32, 1);
@@ -34,22 +32,15 @@ const BLOCK_HASH = toRootHex(Buffer.alloc(32, 3));
 const FEE_RECIPIENT = Buffer.alloc(20, 4);
 
 describe("SlotBidder", () => {
-  it("uses streamed proposer preferences without mutating the retained value", async () => {
-    const api = getApiClientStub();
-    api.events.eventstream.mockResolvedValue(mockApiResponse({data: undefined, meta: undefined}));
-    const tracker = new ProposerPreferencesTracker(api, getMockedLogger());
-    const controller = new AbortController();
-    tracker.start(controller.signal);
+  it("uses retained proposer preferences without mutating the value", async () => {
+    const tracker = new ProposerPreferencesTracker();
     const signed = ssz.gloas.SignedProposerPreferences.defaultValue();
     signed.message.proposalSlot = SLOT;
     signed.message.dependentRoot = Buffer.alloc(32, 5);
     signed.message.feeRecipient = Uint8Array.from(FEE_RECIPIENT);
     const dependentRoot = toRootHex(signed.message.dependentRoot);
     const original = ssz.gloas.SignedProposerPreferences.serialize(signed);
-    api.events.eventstream.mock.calls[0][0].onEvent({
-      type: routes.events.EventType.proposerPreferences,
-      message: {version: ForkName.gloas, data: signed},
-    });
+    tracker.onProposerPreferences(signed);
 
     const preferences = tracker.get(SLOT, dependentRoot);
     if (preferences === null) throw Error("Expected retained preferences");
@@ -61,7 +52,6 @@ describe("SlotBidder", () => {
     expect(publish).toHaveBeenCalledOnce();
     expect(publish.mock.calls[0][0].feeRecipient).toEqual(Uint8Array.from(FEE_RECIPIENT));
     expect(ssz.gloas.SignedProposerPreferences.serialize(preferences)).toEqual(original);
-    controller.abort();
   });
 
   it.each([-1n, -999_999_999n, -1_000_000_000n, (BigInt(Number.MAX_SAFE_INTEGER) + 1n) * 1_000_000_000n])(
