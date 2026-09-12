@@ -1,134 +1,88 @@
 import {describe, expect, it} from "vitest";
-import {ForkName, type ForkPostGloas} from "@lodestar/params";
-import {type Root, ssz} from "@lodestar/types";
-import {toRootHex} from "@lodestar/utils";
-import type {BuiltPayload} from "../../../src/services/payloadSource.js";
-import {PayloadStore, PayloadStoreError, PayloadStoreErrorCode} from "../../../src/services/payloadStore.js";
+import {PayloadStore} from "../../../src/services/payloadStore.js";
+import {mockBuiltPayload} from "../utils/payload.js";
 
 describe("PayloadStore", () => {
-  it("derives the key and preserves exact payload material", () => {
+  const blockHash = "0x" + "cc".repeat(32);
+
+  it("returns no payload for an unknown hash and can prune an empty store", () => {
     const store = new PayloadStore();
-    const payload = getBuiltPayload(ForkName.gloas, 1);
-    const parentBlockRoot = getRoot(2);
 
-    const result = store.add({slot: 10, parentBlockRoot, payload});
-    const blockHash = toRootHex(payload.executionPayload.blockHash);
-
-    expect(result.status).toBe("stored");
-    expect(result.record.blockHash).toBe(blockHash);
-    expect(result.record.parentBlockRoot).toBe(parentBlockRoot);
-    expect(result.record.payload).toBe(payload);
-    expect(result.record.payload.blobsBundle).toBe(payload.blobsBundle);
-    expect(result.record.payload.executionRequests).toBe(payload.executionRequests);
-    expect(result.record.payload.executionPayloadValue).toBe(12_345_678_901_234_567_890n);
-    expect(store.get(blockHash)).toBe(result.record);
-  });
-
-  it("preserves the first record for an existing block hash", () => {
-    const store = new PayloadStore();
-    const firstPayload = getBuiltPayload(ForkName.gloas, 1);
-    const duplicatePayload = getBuiltPayload(ForkName.gloas, 1);
-    duplicatePayload.executionPayloadValue = 1n;
-    const first = store.add({slot: 10, parentBlockRoot: getRoot(2), payload: firstPayload});
-
-    const duplicate = store.add({slot: 11, parentBlockRoot: getRoot(3), payload: duplicatePayload});
-
-    expect(duplicate.status).toBe("already_stored");
-    expect(duplicate.record).toBe(first.record);
-    expect(duplicate.record.payload).toBe(firstPayload);
-    expect(store.size).toBe(1);
-  });
-
-  it("fails closed when unexpired records reach the capacity bound", () => {
-    const store = new PayloadStore({maxEntries: 1});
-    store.add({slot: 10, parentBlockRoot: getRoot(2), payload: getBuiltPayload(ForkName.gloas, 1)});
-
-    const error = getPayloadStoreError(() =>
-      store.add({slot: 10, parentBlockRoot: getRoot(3), payload: getBuiltPayload(ForkName.gloas, 4)})
-    );
-
-    expect(error.type).toEqual({
-      code: PayloadStoreErrorCode.CAPACITY_REACHED,
-      blockHash: toRootHex(getRoot(4)),
-      maxEntries: 1,
-    });
-    expect(store.size).toBe(1);
-  });
-
-  it("prunes only after the configured retention boundary", () => {
-    const store = new PayloadStore({keepSlots: 2});
-    const payload = getBuiltPayload(ForkName.gloas, 1);
-    const blockHash = toRootHex(payload.executionPayload.blockHash);
-    store.add({slot: 5, parentBlockRoot: getRoot(2), payload});
-
-    expect(store.prune(7)).toBe(0);
-    expect(store.get(blockHash)).not.toBeNull();
-    expect(store.prune(8)).toBe(1);
     expect(store.get(blockHash)).toBeNull();
-  });
-
-  it("deletes an exact retained record", () => {
-    const store = new PayloadStore();
-    const payload = getBuiltPayload(ForkName.gloas, 1);
-    const blockHash = toRootHex(payload.executionPayload.blockHash);
-    store.add({slot: 10, parentBlockRoot: getRoot(2), payload});
-
-    expect(store.delete(blockHash)).toBe(true);
-    expect(store.delete(blockHash)).toBe(false);
+    expect(store.has(blockHash)).toBe(false);
+    store.prune(8);
     expect(store.size).toBe(0);
   });
 
-  it("retains post-Gloas fork material without narrowing it", () => {
+  it("stores and prunes payloads by slot", () => {
     const store = new PayloadStore();
-    const payload = getBuiltPayload(ForkName.heze, 1);
-
-    const result = store.add({slot: 10, parentBlockRoot: getRoot(2), payload});
-
-    expect(result.record.payload).toBe(payload);
-    expect(result.record.payload.fork).toBe(ForkName.heze);
+    store.add({slot: 5, parentBlockRoot: Buffer.alloc(32), blockHash, payload: mockBuiltPayload()});
+    expect(store.has(blockHash)).toBe(true);
+    expect(store.get(blockHash)?.slot).toEqual(5);
+    store.prune(7);
+    expect(store.has(blockHash)).toBe(true);
+    store.prune(8);
+    expect(store.has(blockHash)).toBe(false);
+    expect(store.get(blockHash)).toBeNull();
   });
 
-  it.each([
-    ["maxEntries", 0, {maxEntries: 0}],
-    ["keepSlots", -1, {keepSlots: -1}],
-    ["maxEntries", 1.5, {maxEntries: 1.5}],
-    ["keepSlots", Number.MAX_SAFE_INTEGER + 1, {keepSlots: Number.MAX_SAFE_INTEGER + 1}],
-  ] as const)("rejects an invalid %s option", (option, value, options) => {
-    const error = getPayloadStoreError(() => new PayloadStore(options));
+  it("does not increase the size when the same payload is added twice", () => {
+    const store = new PayloadStore();
+    const stored = {slot: 5, parentBlockRoot: Buffer.alloc(32), blockHash, payload: mockBuiltPayload({slot: 5})};
 
-    expect(error.type).toEqual({
-      code: PayloadStoreErrorCode.INVALID_OPTION,
-      option,
-      value,
+    store.add(stored);
+    store.add(stored);
+
+    expect(store.size).toBe(1);
+    expect(store.get(blockHash)).toEqual(stored);
+  });
+
+  it("replaces the record at an existing key", () => {
+    const store = new PayloadStore();
+    const first = {slot: 5, parentBlockRoot: Buffer.alloc(32), blockHash, payload: mockBuiltPayload({slot: 5})};
+    const replacement = {...first, slot: 6, payload: mockBuiltPayload({slot: 6})};
+
+    store.add(first);
+    store.add(replacement);
+
+    expect(store.size).toBe(1);
+    expect(store.get(blockHash)).toBe(replacement);
+  });
+
+  it("prunes expired payloads regardless of insertion order and keeps all retained hashes", () => {
+    const store = new PayloadStore();
+    const records = [8, 5, 6, 8].map((slot, index) => {
+      const hash = Buffer.alloc(32, index + 1);
+      return {
+        slot,
+        parentBlockRoot: Buffer.alloc(32, index + 5),
+        blockHash: "0x" + hash.toString("hex"),
+        payload: mockBuiltPayload({slot, blockHash: hash}),
+      };
     });
+    for (const record of records) store.add(record);
+    expect(store.size).toBe(4);
+
+    store.prune(8);
+    store.prune(8);
+    expect(store.size).toBe(3);
+    for (const record of records) {
+      const retained = record.slot >= 6;
+      expect(store.has(record.blockHash), `membership for slot ${record.slot}`).toBe(retained);
+      expect(store.get(record.blockHash), `payload for hash ${record.blockHash}`).toEqual(retained ? record : null);
+    }
+
+    store.prune(9);
+    expect(store.size).toBe(2);
+    expect(store.has(records[2].blockHash)).toBe(false);
+    for (const record of [records[0], records[3]]) {
+      expect(store.get(record.blockHash), `retained slot-8 hash ${record.blockHash}`).toEqual(record);
+    }
+
+    store.prune(11);
+    expect(store.size).toBe(0);
+    for (const record of records) {
+      expect(store.get(record.blockHash), `expired hash ${record.blockHash}`).toBeNull();
+    }
   });
 });
-
-function getBuiltPayload<F extends ForkPostGloas>(fork: F, blockHashByte: number): BuiltPayload<F> {
-  const executionPayload = ssz[fork].ExecutionPayload.defaultValue();
-  executionPayload.blockHash = getRoot(blockHashByte);
-  return {
-    sourceId: "engine-0",
-    fork,
-    executionPayload,
-    blobsBundle: ssz[fork].BlobsBundle.defaultValue(),
-    executionRequests: ssz[fork].ExecutionRequests.defaultValue(),
-    executionPayloadValue: 12_345_678_901_234_567_890n,
-  };
-}
-
-function getRoot(byte: number): Root {
-  return Uint8Array.from({length: 32}, () => byte);
-}
-
-function getPayloadStoreError(fn: () => unknown): PayloadStoreError {
-  try {
-    fn();
-    throw Error("Expected PayloadStoreError");
-  } catch (error) {
-    if (!(error instanceof PayloadStoreError)) {
-      throw error;
-    }
-    return error;
-  }
-}
