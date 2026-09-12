@@ -324,7 +324,7 @@ function setup(slot = 10, withPreference = true) {
   const clock = new ClockMock();
   clock.currentSlot = slot - 1;
   const api = getApiClientStub();
-  const tracker = new ProposerPreferencesTracker(api, getMockedLogger());
+  const tracker = new ProposerPreferencesTracker();
   const data = ssz.gloas.SSEPayloadAttributes.defaultValue();
   data.proposalSlot = slot;
   data.proposerIndex = 7;
