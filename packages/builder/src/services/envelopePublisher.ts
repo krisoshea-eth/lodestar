@@ -1,6 +1,6 @@
 import {type ApiClient, routes} from "@lodestar/api";
-import type {BuilderIndex, RootHex, Slot, gloas} from "@lodestar/types";
-import {LodestarError, toRootHex} from "@lodestar/utils";
+import {type BuilderIndex, type RootHex, type Slot, type gloas, ssz} from "@lodestar/types";
+import {LodestarError, defer, toRootHex} from "@lodestar/utils";
 import type {BidLedger} from "./bidLedger.js";
 import type {BuilderSigner} from "./builderSigner.js";
 
@@ -45,8 +45,16 @@ export type EnvelopePublicationResult =
   | {status: "published"; signedEnvelope: gloas.SignedExecutionPayloadEnvelope}
   | {status: "duplicate"};
 
+type ActivePublication = {
+  controller: AbortController;
+  promise: Promise<EnvelopePublicationResult>;
+  waiters: number;
+};
+
 /** Signs and submits stateless envelope material for an exact recorded local selection. */
 export class EnvelopePublisher {
+  private readonly activePublications = new Map<RootHex, ActivePublication>();
+
   constructor(private readonly modules: EnvelopePublisherModules) {}
 
   async publish(material: EnvelopePublicationMaterial, signal: AbortSignal): Promise<EnvelopePublicationResult> {
@@ -79,15 +87,66 @@ export class EnvelopePublisher {
       );
     }
 
-    if (ledger.hasRevealed(identity.blockRoot)) {
-      if (!ledger.canReveal(identity.blockRoot, identity.blockHash)) {
-        ledger.recordReveal(identity.slot, identity.blockRoot, identity.blockHash);
-      }
+    const envelopeRoot = toRootHex(ssz.gloas.ExecutionPayloadEnvelope.hashTreeRoot(envelope));
+    ledger.recordReveal(identity.slot, identity.blockRoot, identity.blockHash, envelopeRoot);
+    if (ledger.hasPublishedReveal(identity.blockRoot)) {
       return {status: "duplicate"};
     }
 
-    const signedEnvelope = signer.signExecutionPayloadEnvelope(envelope);
-    ledger.recordReveal(identity.slot, identity.blockRoot, identity.blockHash);
+    let publication = this.activePublications.get(identity.blockRoot);
+    if (publication === undefined) {
+      const controller = new AbortController();
+      publication = {
+        controller,
+        waiters: 0,
+        promise: this.publishEnvelope(material, identity, envelopeRoot, api, ledger, signer, controller.signal).finally(
+          () => {
+            if (this.activePublications.get(identity.blockRoot)?.controller === controller) {
+              this.activePublications.delete(identity.blockRoot);
+            }
+          }
+        ),
+      };
+      this.activePublications.set(identity.blockRoot, publication);
+    }
+    return this.waitForPublication(identity.blockRoot, publication, signal);
+  }
+
+  private async waitForPublication(
+    blockRoot: RootHex,
+    publication: ActivePublication,
+    signal: AbortSignal
+  ): Promise<EnvelopePublicationResult> {
+    const aborted = defer<never>();
+    const onAbort = (): void => aborted.reject(signal.reason);
+    publication.waiters++;
+    signal.addEventListener("abort", onAbort, {once: true});
+    if (signal.aborted) onAbort();
+
+    try {
+      return await Promise.race([publication.promise, aborted.promise]);
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+      publication.waiters--;
+      if (publication.waiters === 0 && signal.aborted) {
+        if (this.activePublications.get(blockRoot) === publication) {
+          this.activePublications.delete(blockRoot);
+        }
+        publication.controller.abort(signal.reason);
+      }
+    }
+  }
+
+  private async publishEnvelope(
+    material: EnvelopePublicationMaterial,
+    identity: EnvelopeSelectionIdentity,
+    envelopeRoot: RootHex,
+    api: ApiClient,
+    ledger: BidLedger,
+    signer: BuilderSigner,
+    signal: AbortSignal
+  ): Promise<EnvelopePublicationResult> {
+    const signedEnvelope = signer.signExecutionPayloadEnvelope(material.envelope);
 
     const response = await api.beacon.publishExecutionPayloadEnvelope(
       {
@@ -101,6 +160,8 @@ export class EnvelopePublisher {
       {signal}
     );
     response.assertOk();
+    signal.throwIfAborted();
+    ledger.recordRevealPublished(identity.slot, identity.blockRoot, identity.blockHash, envelopeRoot);
     return {status: "published", signedEnvelope};
   }
 }
