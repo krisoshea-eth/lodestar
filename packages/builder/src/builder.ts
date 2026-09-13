@@ -7,12 +7,21 @@ import {waitForGenesis} from "./genesis.js";
 import {resolveBuilderIdentity} from "./identity.js";
 import {Metrics} from "./metrics.js";
 import {logNodeVersion, waitForNodeReady} from "./readiness.js";
+import {BidLedger} from "./services/bidLedger.js";
+import type {BidPolicy} from "./services/bidPolicy.js";
+import {BidPublisher} from "./services/bidPublisher.js";
 import {BlockObserver} from "./services/blockObserver.js";
 import {BuilderSigner, Keypair} from "./services/builderSigner.js";
 import {BuilderStatusTracker} from "./services/builderStatusTracker.js";
-import type {PayloadAttributesConsumer} from "./services/payloadAttributesConsumer.js";
+import {
+  PayloadAttributesConsumer,
+  type PayloadAttributesConsumerOptions,
+} from "./services/payloadAttributesConsumer.js";
+import {PayloadOrchestrator, type PayloadOrchestratorOptions} from "./services/payloadOrchestrator.js";
+import type {PayloadSource} from "./services/payloadSource.js";
 import {PayloadStore} from "./services/payloadStore.js";
 import {ProposerPreferencesTracker} from "./services/proposerPreferencesTracker.js";
+import {SlotBidder} from "./services/slotBidder.js";
 
 export type BuilderModules = {
   opts: BuilderOptions;
@@ -24,6 +33,16 @@ export type BuilderModules = {
   index: BuilderIndex;
   payloadStore: PayloadStore;
   payloadAttributesConsumer?: PayloadAttributesConsumer;
+  bidLedger?: BidLedger;
+};
+
+/** Opt-in experiment requiring the proposed Gloas payload-attributes input contract. */
+export type BuilderBidOptions = {
+  source: PayloadSource;
+  policy: BidPolicy;
+  orchestration: PayloadOrchestratorOptions;
+  inputs: Omit<PayloadAttributesConsumerOptions, "executionFeeRecipient">;
+  minOperatingBalanceGwei: number;
 };
 
 export type BuilderOptions = {
@@ -35,6 +54,7 @@ export type BuilderOptions = {
   clock?: ClockOptions;
   executionFeeRecipient: ExecutionAddress;
   metrics: Metrics | null;
+  bidRuntime?: BuilderBidOptions;
 };
 
 /**
@@ -52,6 +72,7 @@ export class Builder {
   private readonly executionFeeRecipient: ExecutionAddress;
   private readonly payloadStore: PayloadStore;
   private readonly payloadAttributesConsumer: PayloadAttributesConsumer | undefined;
+  private readonly bidLedger: BidLedger | undefined;
 
   constructor({
     opts,
@@ -63,6 +84,7 @@ export class Builder {
     index,
     payloadStore,
     payloadAttributesConsumer,
+    bidLedger,
   }: BuilderModules) {
     this.builderSigner = builderSigner;
     this.blockObserver = blockObserver;
@@ -74,6 +96,7 @@ export class Builder {
     this.index = index;
     this.payloadStore = payloadStore;
     this.payloadAttributesConsumer = payloadAttributesConsumer;
+    this.bidLedger = bidLedger;
 
     this.executionFeeRecipient = opts.executionFeeRecipient;
 
@@ -121,6 +144,47 @@ export class Builder {
     const proposerPreferencesTracker = new ProposerPreferencesTracker();
 
     const payloadStore = new PayloadStore();
+    let bidLedger: BidLedger | undefined;
+    let payloadAttributesConsumer: PayloadAttributesConsumer | undefined;
+    if (opts.bidRuntime) {
+      const {source, policy, orchestration, inputs, minOperatingBalanceGwei} = opts.bidRuntime;
+      bidLedger = new BidLedger();
+      const publisher = new BidPublisher({
+        api,
+        config,
+        signer: builderSigner,
+        ledger: bidLedger,
+        builderIndex: index,
+        hasPayload: (identity) => {
+          const stored = payloadStore.get(identity.blockHash);
+          return (
+            stored !== null &&
+            stored.slot === identity.slot &&
+            toRootHex(stored.parentBlockRoot) === identity.parentBlockRoot &&
+            toRootHex(stored.payload.executionPayload.parentHash) === identity.parentBlockHash &&
+            toRootHex(stored.payload.executionPayload.blockHash) === identity.blockHash &&
+            stored.payload.fork === config.getForkName(identity.slot)
+          );
+        },
+      });
+      const bidder = new SlotBidder(
+        {
+          orchestrator: new PayloadOrchestrator(source, orchestration),
+          store: payloadStore,
+          policy,
+          ledger: bidLedger,
+          publisher,
+          builderIndex: index,
+          getBuilderStatus: () => builderStatusTracker.getStatus(),
+        },
+        {minOperatingBalanceGwei}
+      );
+      payloadAttributesConsumer = new PayloadAttributesConsumer(
+        {config, clock, preferences: proposerPreferencesTracker, bidder},
+        {...inputs, executionFeeRecipient: opts.executionFeeRecipient}
+      );
+    }
+    opts.abortController.signal.throwIfAborted();
 
     return new Builder({
       opts,
@@ -131,11 +195,14 @@ export class Builder {
       clock,
       index,
       payloadStore,
+      bidLedger,
+      payloadAttributesConsumer,
     });
   }
 
   private async onSlot(slot: number): Promise<void> {
     this.payloadAttributesConsumer?.onSlot(slot);
+    this.bidLedger?.prune(slot);
     this.payloadStore.prune(slot);
     this.proposerPreferencesTracker.prune(slot);
   }

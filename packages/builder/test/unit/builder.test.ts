@@ -1,7 +1,7 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
 import {SecretKey} from "@chainsafe/lodestar-z/blst";
 import {routes} from "@lodestar/api";
-import {createBeaconConfig} from "@lodestar/config";
+import {chainConfigToJson, createBeaconConfig} from "@lodestar/config";
 import {getConfig} from "@lodestar/config/test-utils";
 import {ForkName, MIN_DEPOSIT_AMOUNT} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
@@ -13,12 +13,14 @@ import {BlockObserver, ObservedBlock} from "../../src/services/blockObserver.js"
 import {BuilderSigner} from "../../src/services/builderSigner.js";
 import {BuilderStatusTracker} from "../../src/services/builderStatusTracker.js";
 import {PayloadAttributesConsumer} from "../../src/services/payloadAttributesConsumer.js";
+import type {PayloadSource} from "../../src/services/payloadSource.js";
 import {PayloadStore} from "../../src/services/payloadStore.js";
 import {ProposerPreferencesTracker} from "../../src/services/proposerPreferencesTracker.js";
 import {SlotBidder} from "../../src/services/slotBidder.js";
 import {getApiClientStub, mockApiResponse} from "./utils/apiStub.js";
 import {ClockMock} from "./utils/clock.js";
 import {getMockedLogger} from "./utils/logger.js";
+import {mockGetStateBuildersResponse} from "./utils/mocks.js";
 import {mockBuiltPayload} from "./utils/payload.js";
 
 const {EventType} = routes.events;
@@ -63,6 +65,7 @@ describe("Builder", () => {
   afterEach(() => {
     controller.abort();
     vi.restoreAllMocks();
+    vi.useRealTimers();
   });
 
   it("starts one shared stream after the clock and preserves slot pruning", async () => {
@@ -380,6 +383,196 @@ describe("Builder", () => {
     expect(logger.warn).not.toHaveBeenCalled();
     expect(logger.error).not.toHaveBeenCalled();
     await builder.close();
+  });
+
+  describe("opt-in bid runtime", () => {
+    function prepareStartup() {
+      vi.useFakeTimers();
+      const {events, data} = configureInputs(modules, clock);
+      vi.setSystemTime(9 * modules.opts.config.SLOT_DURATION_MS + modules.opts.config.getSlotComponentDurationMs(6667));
+      api.beacon.getGenesis.mockResolvedValue(
+        mockApiResponse({data: ssz.phase0.Genesis.defaultValue(), meta: undefined})
+      );
+      Object.assign(api, {
+        config: {
+          getSpec: vi
+            .fn()
+            .mockResolvedValue(mockApiResponse({data: chainConfigToJson(modules.opts.config), meta: undefined})),
+        },
+      });
+      api.node.getSyncingStatus.mockResolvedValue(
+        mockApiResponse({
+          data: {headSlot: 9, syncDistance: 0, isSyncing: false, isOptimistic: false, elOffline: false},
+          meta: undefined,
+        })
+      );
+      api.node.getNodeVersionV2.mockResolvedValue(
+        mockApiResponse({
+          data: {beaconNode: {code: routes.node.ClientCode.LS, name: "Lodestar", version: "test", commit: "00000000"}},
+          meta: undefined,
+        })
+      );
+      api.beacon.getStateBuilders.mockResolvedValue(
+        mockGetStateBuildersResponse(1, {
+          pubkey: modules.opts.keypair.publicKey.toBytes(),
+          balance: MIN_DEPOSIT_AMOUNT + 100,
+        })
+      );
+      const publish = vi.fn().mockResolvedValue(mockApiResponse({data: undefined, meta: undefined}));
+      Object.assign(api.beacon, {publishExecutionPayloadBid: publish});
+      const payload = mockBuiltPayload({
+        slot: 10,
+        parentHash: data.parentBlockHash,
+        prevRandao: data.payloadAttributes.prevRandao,
+        valueGwei: 10,
+      });
+      const source = {
+        id: "el",
+        prepare: vi
+          .fn<PayloadSource["prepare"]>()
+          .mockResolvedValue({sourceId: "el", fork: ForkName.gloas, payloadId: "0x0102030405060708"}),
+        getPayload: vi.fn<PayloadSource["getPayload"]>().mockResolvedValue(payload),
+      };
+      modules.opts.bidRuntime = {
+        // Vitest erases the generic return correlation; this fixture serves Gloas only.
+        source: source as unknown as PayloadSource,
+        policy: {computeValue: () => 1},
+        orchestration: {maxActiveJobs: 1, getPayloadTimeout: 1000},
+        inputs: {custodyColumns: [0, 3], deadlineBps: 9000, maxInputsPerSlot: 2},
+        minOperatingBalanceGwei: MIN_DEPOSIT_AMOUNT,
+      };
+      return {events, source, payload, publish, options: modules.opts.bidRuntime};
+    }
+
+    it("constructs and runs the bid path through Builder.init", async () => {
+      const {events, source, payload, publish} = prepareStartup();
+      const stored = vi.spyOn(PayloadStore.prototype, "add");
+      const builder = await Builder.init(modules.opts);
+      const {onEvent, topics: subscribed} = api.events.eventstream.mock.calls[0][0];
+      expect(subscribed).toEqual([...topics, EventType.headV2, EventType.payloadAttributes]);
+      onEvent(events.head);
+      onEvent(events.attributes);
+      expect(source.prepare).not.toHaveBeenCalled();
+      onEvent(events.preference);
+      await vi.advanceTimersByTimeAsync(modules.opts.config.SLOT_DURATION_MS / 2);
+      expect(source.prepare).toHaveBeenCalledOnce();
+      expect(source.prepare.mock.calls[0][0]).toMatchObject({
+        forkchoiceState: {
+          headBlockHash: toRootHex(events.attributes.message.data.parentBlockHash),
+          safeBlockHash: toRootHex(events.attributes.message.data.safeBlockHash),
+          finalizedBlockHash: toRootHex(events.attributes.message.data.finalizedBlockHash),
+        },
+        custodyColumns: [0, 3],
+      });
+      expect(source.getPayload).toHaveBeenCalledOnce();
+      expect(publish).toHaveBeenCalledOnce();
+      expect(stored).toHaveBeenCalledWith(
+        expect.objectContaining({blockHash: toRootHex(payload.executionPayload.blockHash)})
+      );
+      expect(stored.mock.invocationCallOrder[0]).toBeLessThan(publish.mock.invocationCallOrder[0]);
+      expect(publish.mock.calls[0][0].signedExecutionPayloadBid.message.feeRecipient).toEqual(
+        events.preference.message.data.message.feeRecipient
+      );
+      onEvent(events.attributes);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(publish).toHaveBeenCalledOnce();
+      expect(logger.warn).not.toHaveBeenCalled();
+      await builder.close();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("does not construct bid services without an explicit runtime configuration", async () => {
+      const {source} = prepareStartup();
+      delete modules.opts.bidRuntime;
+      const builder = await Builder.init(modules.opts);
+      expect(api.events.eventstream.mock.calls[0][0].topics).toEqual(topics);
+      expect(source.prepare).not.toHaveBeenCalled();
+      await builder.close();
+    });
+
+    it("prunes the runtime ledger on startup and each slot", async () => {
+      prepareStartup();
+      const prune = vi.spyOn(BidLedger.prototype, "prune");
+      const builder = await Builder.init(modules.opts);
+      expect(prune).toHaveBeenCalledExactlyOnceWith(9);
+      await vi.advanceTimersByTimeAsync(modules.opts.config.SLOT_DURATION_MS);
+      expect(prune).toHaveBeenLastCalledWith(10);
+      expect(prune).toHaveBeenCalledTimes(2);
+      await builder.close();
+      await vi.advanceTimersByTimeAsync(modules.opts.config.SLOT_DURATION_MS);
+      expect(prune).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not start the runtime if cancellation arrives during identity lookup", async () => {
+      prepareStartup();
+      api.beacon.getStateBuilders.mockImplementationOnce(async () => {
+        controller.abort();
+        return mockGetStateBuildersResponse(1, {pubkey: modules.opts.keypair.publicKey.toBytes()});
+      });
+      await expect(Builder.init(modules.opts)).rejects.toMatchObject({name: "AbortError"});
+      expect(api.events.eventstream).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("rejects invalid runtime options before starting the clock or subscription", async () => {
+      const {options} = prepareStartup();
+      options.orchestration.maxActiveJobs = 0;
+      await expect(Builder.init(modules.opts)).rejects.toMatchObject({
+        type: {code: "PAYLOAD_ORCHESTRATOR_ERROR_INVALID_OPTION"},
+      });
+      expect(api.events.eventstream).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("cancels a pending build on shutdown and ignores its late result", async () => {
+      const {events, source, publish} = prepareStartup();
+      const pending = defer<Awaited<ReturnType<PayloadSource["prepare"]>>>();
+      source.prepare.mockReturnValue(pending.promise);
+      const builder = await Builder.init(modules.opts);
+      const {onEvent} = api.events.eventstream.mock.calls[0][0];
+      onEvent(events.preference);
+      onEvent(events.head);
+      onEvent(events.attributes);
+      expect(source.prepare).toHaveBeenCalledOnce();
+      await builder.close();
+      expect(source.prepare.mock.calls[0][1].aborted).toBe(true);
+      pending.resolve({sourceId: "el", fork: ForkName.gloas, payloadId: "0x0102030405060708"});
+      await vi.advanceTimersByTimeAsync(modules.opts.config.SLOT_DURATION_MS);
+      expect(source.getPayload).not.toHaveBeenCalled();
+      expect(publish).not.toHaveBeenCalled();
+      expect(logger.warn).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it.each(["slot", "parentRoot", "parentHash", "blockHash", "fork"])(
+      "does not publish if retained %s identity differs",
+      async (field) => {
+        const {events, publish} = prepareStartup();
+        const add = PayloadStore.prototype.add;
+        vi.spyOn(PayloadStore.prototype, "add").mockImplementation(function (this: PayloadStore, stored) {
+          if (field === "slot") stored.slot++;
+          if (field === "parentRoot") stored.parentBlockRoot = Buffer.alloc(32, 9);
+          if (field === "parentHash") stored.payload.executionPayload.parentHash = Buffer.alloc(32, 9);
+          if (field === "blockHash") stored.payload.executionPayload.blockHash = Buffer.alloc(32, 9);
+          if (field === "fork") stored.payload.fork = ForkName.heze;
+          add.call(this, stored);
+        });
+        const builder = await Builder.init(modules.opts);
+        const {onEvent} = api.events.eventstream.mock.calls[0][0];
+        onEvent(events.preference);
+        onEvent(events.head);
+        onEvent(events.attributes);
+        await vi.advanceTimersByTimeAsync(modules.opts.config.SLOT_DURATION_MS / 2);
+        expect(publish).not.toHaveBeenCalled();
+        expect(logger.warn).toHaveBeenCalledWith(
+          "Failed to process builder event",
+          {eventType: EventType.payloadAttributes},
+          expect.objectContaining({type: expect.objectContaining({code: "BID_PUBLISHER_ERROR_PAYLOAD_NOT_RETAINED"})})
+        );
+        await builder.close();
+      }
+    );
   });
 });
 
