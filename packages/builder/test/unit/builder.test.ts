@@ -6,7 +6,7 @@ import {getConfig} from "@lodestar/config/test-utils";
 import {ForkName, MIN_DEPOSIT_AMOUNT} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
 import {ErrorAborted, defer, toRootHex} from "@lodestar/utils";
-import {Builder, BuilderModules} from "../../src/builder.js";
+import {Builder, type BuilderBidOptions, BuilderModules} from "../../src/builder.js";
 import {BidLedger} from "../../src/services/bidLedger.js";
 import {BidPublisher} from "../../src/services/bidPublisher.js";
 import {BlockObserver, ObservedBlock} from "../../src/services/blockObserver.js";
@@ -479,6 +479,170 @@ describe("Builder", () => {
       expect(logger.warn).not.toHaveBeenCalled();
       await builder.close();
       await vi.advanceTimersByTimeAsync(0);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    async function prepareSelection(shouldReveal?: NonNullable<BuilderBidOptions["reveal"]>["shouldReveal"]) {
+      const {events, payload, publish, options} = prepareStartup();
+      options.reveal = shouldReveal ? {cutoffBps: 5000, shouldReveal} : undefined;
+      const reveal = vi.fn().mockResolvedValue(mockApiResponse({data: undefined, meta: undefined}));
+      Object.assign(api.beacon, {publishExecutionPayloadEnvelope: reveal});
+      const builder = await Builder.init(modules.opts);
+      const {onEvent} = api.events.eventstream.mock.calls[0][0];
+      onEvent(events.preference);
+      onEvent(events.head);
+      onEvent(events.attributes);
+      await vi.advanceTimersByTimeAsync(modules.opts.config.SLOT_DURATION_MS / 2);
+      expect(publish).toHaveBeenCalledOnce();
+      const block = ssz.gloas.SignedBeaconBlock.defaultValue();
+      block.message.slot = 10;
+      block.message.body.signedExecutionPayloadBid = ssz.gloas.SignedExecutionPayloadBid.clone(
+        publish.mock.calls[0][0].signedExecutionPayloadBid
+      );
+      api.beacon.getBlockV2.mockResolvedValue(
+        mockApiResponse({data: block, meta: {version: ForkName.gloas, executionOptimistic: false, finalized: false}})
+      );
+      const emitBlock = () => {
+        const blockRoot = toRootHex(ssz.gloas.BeaconBlock.hashTreeRoot(block.message));
+        onEvent({type: EventType.block, message: {slot: 10, block: blockRoot, executionOptimistic: false}});
+        return blockRoot;
+      };
+      return {builder, block, payload, reveal, emitBlock};
+    }
+
+    it("observes an exact local selection and publishes retained envelope material", async () => {
+      const shouldReveal = vi.fn(async () => true);
+      const {builder, payload, reveal, emitBlock} = await prepareSelection(shouldReveal);
+      const blockRoot = emitBlock();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(shouldReveal).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({blockRoot, slot: 10, executionOptimistic: false}),
+        expect.any(AbortSignal)
+      );
+      expect(reveal).toHaveBeenCalledOnce();
+      expect(reveal.mock.calls[0][0]).toMatchObject({
+        signedEnvelopeOrContents: {
+          signedExecutionPayloadEnvelope: {message: {payload: payload.executionPayload, builderIndex: 1}},
+          blobs: payload.blobsBundle.blobs,
+          kzgProofs: payload.blobsBundle.proofs,
+        },
+        broadcastValidation: routes.beacon.BroadcastValidation.consensusAndEquivocation,
+      });
+      emitBlock();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reveal).toHaveBeenCalledOnce();
+      expect(logger.error).not.toHaveBeenCalled();
+      await builder.close();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it.each(["absent", "declined"])("records a selection without revealing when policy is %s", async (mode) => {
+      const recordWin = vi.spyOn(BidLedger.prototype, "recordWin");
+      const {builder, reveal, emitBlock} = await prepareSelection(mode === "absent" ? undefined : async () => false);
+      const blockRoot = emitBlock();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(recordWin).toHaveBeenCalledOnce();
+      expect(recordWin.mock.results[0].value).toMatchObject({wonBlockRoots: [blockRoot]});
+      expect(reveal).not.toHaveBeenCalled();
+      await builder.close();
+    });
+
+    it("does not consult reveal policy for a changed bid", async () => {
+      const shouldReveal = vi.fn(async () => true);
+      const {builder, block, reveal, emitBlock} = await prepareSelection(shouldReveal);
+      block.message.body.signedExecutionPayloadBid.message.value++;
+      emitBlock();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(shouldReveal).not.toHaveBeenCalled();
+      expect(reveal).not.toHaveBeenCalled();
+      await builder.close();
+    });
+
+    it("does not publish a reveal after shutdown during the policy decision", async () => {
+      const pending = defer<boolean>();
+      const shouldReveal = vi.fn(() => pending.promise);
+      const {builder, reveal, emitBlock} = await prepareSelection(shouldReveal);
+      emitBlock();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(shouldReveal).toHaveBeenCalledOnce();
+      await builder.close();
+      pending.resolve(true);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reveal).not.toHaveBeenCalled();
+    });
+
+    it("rechecks retention after an asynchronous reveal decision", async () => {
+      const pending = defer<boolean>();
+      const {builder, reveal, emitBlock} = await prepareSelection(() => pending.promise);
+      emitBlock();
+      await vi.advanceTimersByTimeAsync(0);
+      vi.spyOn(PayloadStore.prototype, "get").mockReturnValue(null);
+      pending.resolve(true);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reveal).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith(
+        "Selected payload expired before reveal",
+        expect.objectContaining({code: "BUILDER_REVEAL_PAYLOAD_EXPIRED"})
+      );
+      await builder.close();
+    });
+
+    it("does not consult reveal policy after the cutoff", async () => {
+      const shouldReveal = vi.fn(async () => true);
+      const {builder, reveal, emitBlock} = await prepareSelection(shouldReveal);
+      await vi.advanceTimersByTimeAsync(modules.opts.config.SLOT_DURATION_MS);
+      emitBlock();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(shouldReveal).not.toHaveBeenCalled();
+      expect(reveal).not.toHaveBeenCalled();
+      await builder.close();
+    });
+
+    it("cancels a slow reveal decision at the cutoff and ignores its late result", async () => {
+      const pending = defer<boolean>();
+      const shouldReveal = vi.fn<NonNullable<BuilderBidOptions["reveal"]>["shouldReveal"]>(() => pending.promise);
+      const {builder, reveal, emitBlock} = await prepareSelection(shouldReveal);
+      emitBlock();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(shouldReveal).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(modules.opts.config.SLOT_DURATION_MS);
+      expect(shouldReveal.mock.calls[0][1].aborted).toBe(true);
+      pending.resolve(true);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reveal).not.toHaveBeenCalled();
+      await builder.close();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("cancels in-flight envelope publication at the cutoff", async () => {
+      const recordPublished = vi.spyOn(BidLedger.prototype, "recordRevealPublished");
+      const {builder, reveal, emitBlock} = await prepareSelection(async () => true);
+      const pending = defer<ReturnType<typeof mockApiResponse>>();
+      reveal.mockReturnValueOnce(pending.promise);
+      emitBlock();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reveal).toHaveBeenCalledOnce();
+      const publicationSignal = reveal.mock.calls[0][1].signal;
+      expect(publicationSignal.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(modules.opts.config.SLOT_DURATION_MS);
+      expect(publicationSignal.aborted).toBe(true);
+      pending.resolve(mockApiResponse({data: undefined, meta: undefined}));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(recordPublished).not.toHaveBeenCalled();
+      await builder.close();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it.each([0, 10_000, Number.NaN, 5000.5])("rejects invalid reveal cutoff %s before startup", async (cutoffBps) => {
+      const {options} = prepareStartup();
+      options.reveal = {cutoffBps, shouldReveal: async () => true};
+      await expect(Builder.init(modules.opts)).rejects.toMatchObject({
+        type: {code: "BUILDER_REVEAL_INVALID_CUTOFF"},
+      });
+      expect(api.events.eventstream).not.toHaveBeenCalled();
       expect(vi.getTimerCount()).toBe(0);
     });
 

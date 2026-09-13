@@ -2,7 +2,7 @@ import {ApiClient, routes} from "@lodestar/api";
 import {ChainForkConfig, assertEqualParams, createBeaconConfig} from "@lodestar/config";
 import {Clock, ClockOptions, IClock} from "@lodestar/state-transition";
 import {BuilderIndex, ExecutionAddress} from "@lodestar/types";
-import {Logger, isErrorAborted, toHex, toRootHex} from "@lodestar/utils";
+import {LodestarError, Logger, isErrorAborted, toHex, toRootHex, withTimeout} from "@lodestar/utils";
 import {waitForGenesis} from "./genesis.js";
 import {resolveBuilderIdentity} from "./identity.js";
 import {Metrics} from "./metrics.js";
@@ -10,9 +10,12 @@ import {logNodeVersion, waitForNodeReady} from "./readiness.js";
 import {BidLedger} from "./services/bidLedger.js";
 import type {BidPolicy} from "./services/bidPolicy.js";
 import {BidPublisher} from "./services/bidPublisher.js";
-import {BlockObserver} from "./services/blockObserver.js";
+import {BidSelector} from "./services/bidSelector.js";
+import {BlockObserver, type ObservedBlock} from "./services/blockObserver.js";
 import {BuilderSigner, Keypair} from "./services/builderSigner.js";
 import {BuilderStatusTracker} from "./services/builderStatusTracker.js";
+import {EnvelopePublisher} from "./services/envelopePublisher.js";
+import {createExecutionPayloadEnvelopeMaterial} from "./services/executionPayloadEnvelope.js";
 import {
   PayloadAttributesConsumer,
   type PayloadAttributesConsumerOptions,
@@ -43,6 +46,12 @@ export type BuilderBidOptions = {
   orchestration: PayloadOrchestratorOptions;
   inputs: Omit<PayloadAttributesConsumerOptions, "executionFeeRecipient">;
   minOperatingBalanceGwei: number;
+  reveal?: {
+    /** Publication cutoff within the selected block's slot, not the earlier build slot. */
+    cutoffBps: number;
+    /** Inclusion alone does not authorize reveal. The caller supplies its head/timeliness policy. */
+    shouldReveal: (block: ObservedBlock, signal: AbortSignal) => Promise<boolean>;
+  };
 };
 
 export type BuilderOptions = {
@@ -183,6 +192,80 @@ export class Builder {
         {config, clock, preferences: proposerPreferencesTracker, bidder},
         {...inputs, executionFeeRecipient: opts.executionFeeRecipient}
       );
+      const {reveal} = opts.bidRuntime;
+      if (reveal && (!Number.isSafeInteger(reveal.cutoffBps) || reveal.cutoffBps <= 0 || reveal.cutoffBps >= 10_000)) {
+        throw new LodestarError({code: "BUILDER_REVEAL_INVALID_CUTOFF"});
+      }
+      const ledger = bidLedger;
+      const selector = new BidSelector({
+        config,
+        ledger,
+        builderIndex: index,
+        getRetainedPayloadIdentity: (blockHash) => {
+          const stored = payloadStore.get(blockHash);
+          return stored === null
+            ? null
+            : {
+                slot: stored.slot,
+                parentBlockRoot: toRootHex(stored.parentBlockRoot),
+                parentBlockHash: toRootHex(stored.payload.executionPayload.parentHash),
+                blockHash: toRootHex(stored.payload.executionPayload.blockHash),
+              };
+        },
+      });
+      const envelopePublisher = new EnvelopePublisher({
+        api,
+        signer: builderSigner,
+        ledger,
+        builderIndex: index,
+        hasSelection: (identity) =>
+          ledger
+            .getBidsForSlot(identity.slot)
+            .some(
+              (bid) =>
+                bid.parentBlockRoot === identity.parentBlockRoot &&
+                bid.parentBlockHash === identity.parentBlockHash &&
+                bid.blockHash === identity.blockHash &&
+                bid.wonBlockRoots.includes(identity.blockRoot)
+            ),
+      });
+      blockObserver.runOnBlock(async (observed) => {
+        const signal = opts.abortController.signal;
+        signal.throwIfAborted();
+        const selected = selector.match(observed);
+        if (selected.status !== "selected" || !reveal) return;
+        const cutoff = config.getSlotComponentDurationMs(reveal.cutoffBps);
+        const remaining = cutoff - clock.msFromSlot(observed.slot);
+        if (remaining <= 0 || clock.getCurrentSlot() < observed.slot) return;
+        await withTimeout(
+          async (timeoutSignal) => {
+            const publicationSignal = timeoutSignal ?? signal;
+            if (!(await reveal.shouldReveal(observed, publicationSignal))) return;
+            publicationSignal.throwIfAborted();
+            if (clock.msFromSlot(observed.slot) >= cutoff) return;
+            const storedPayload = payloadStore.get(selected.bid.blockHash);
+            if (storedPayload === null) {
+              logger.warn("Selected payload expired before reveal", {
+                code: "BUILDER_REVEAL_PAYLOAD_EXPIRED",
+                slot: observed.slot,
+                blockRoot: observed.blockRoot,
+              });
+              return;
+            }
+            await envelopePublisher.publish(
+              createExecutionPayloadEnvelopeMaterial({
+                blockRoot: selected.blockRoot,
+                builderIndex: index,
+                selectedBid: selected.bid,
+                storedPayload,
+              }),
+              publicationSignal
+            );
+          },
+          remaining,
+          signal
+        );
+      });
     }
     opts.abortController.signal.throwIfAborted();
 
