@@ -1,9 +1,10 @@
 import {describe, expect, it, vi} from "vitest";
 import {SecretKey} from "@chainsafe/lodestar-z/blst";
+import {BitArray} from "@chainsafe/ssz";
 import {routes} from "@lodestar/api";
 import {createBeaconConfig} from "@lodestar/config";
 import {getConfig} from "@lodestar/config/test-utils";
-import {ForkName, MIN_DEPOSIT_AMOUNT} from "@lodestar/params";
+import {ForkName, INCLUSION_LIST_COMMITTEE_SIZE, MIN_DEPOSIT_AMOUNT} from "@lodestar/params";
 import type {RootHex, heze} from "@lodestar/types";
 import {ssz} from "@lodestar/types";
 import {toRootHex} from "@lodestar/utils";
@@ -368,6 +369,52 @@ describe("SlotBidder", () => {
     });
     expect(store.size).toBe(0);
     expect(publish).not.toHaveBeenCalled();
+  });
+
+  it.each([ForkName.gloas, ForkName.heze] as const)(
+    "rejects a %s payload with different prevRandao before retention or publication",
+    async (fork) => {
+      const payload = builtPayload(fork);
+      payload.executionPayload.prevRandao = Buffer.alloc(32, 6);
+      const input =
+        fork === ForkName.heze ? hezeInput(BitArray.fromBitLen(INCLUSION_LIST_COMMITTEE_SIZE)) : gloasInput();
+      const {bidder, publish, store} = setup(payload);
+
+      await expect(bidder.run(input, new AbortController().signal)).rejects.toMatchObject({
+        type: {code: ExecutionPayloadBidErrorCode.PREV_RANDAO_MISMATCH},
+      });
+      expect(store.size).toBe(0);
+      expect(publish).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([1, INCLUSION_LIST_COMMITTEE_SIZE + 1])(
+    "rejects Heze inclusion-list bit length %s before retention or publication",
+    async (bitLen) => {
+      const {bidder, publish, store} = setup(builtPayload(ForkName.heze));
+      const input = hezeInput(BitArray.fromBitLen(bitLen));
+
+      await expect(bidder.run(input, new AbortController().signal)).rejects.toMatchObject({
+        type: {code: ExecutionPayloadBidErrorCode.INVALID_INCLUSION_LIST_BITS, bitLen},
+      });
+      expect(store.size).toBe(0);
+      expect(publish).not.toHaveBeenCalled();
+    }
+  );
+
+  it("publishes a payload matching the BN-provided prevRandao", async () => {
+    const input = gloasInput();
+    input.job.request.payloadAttributes.prevRandao = Buffer.alloc(32, 7);
+    const payload = builtPayload(ForkName.gloas);
+    payload.executionPayload.prevRandao = Uint8Array.from(input.job.request.payloadAttributes.prevRandao);
+    const {bidder, publish} = setup(payload);
+
+    await bidder.run(input, new AbortController().signal);
+
+    expect(publish).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({prevRandao: input.job.request.payloadAttributes.prevRandao}),
+      expect.any(AbortSignal)
+    );
   });
 
   it("rejects a payload equal to its parent before retention or publication", async () => {
