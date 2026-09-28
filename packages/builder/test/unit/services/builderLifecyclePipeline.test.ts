@@ -98,7 +98,7 @@ describe("Builder lifecycle component pipeline", () => {
       const material = createExecutionPayloadEnvelopeMaterial({
         blockRoot,
         builderIndex,
-        selectedBid: selection.bid,
+        selectedBid: block.message.body.signedExecutionPayloadBid.message,
         storedPayload: stored,
       });
       const envelopePublisher = new EnvelopePublisher({
@@ -138,7 +138,7 @@ describe("Builder lifecycle component pipeline", () => {
   );
 });
 
-function createBuiltPayload(): BuiltPayload<ForkName.gloas> {
+function createBuiltPayload(): BuiltPayload {
   const executionPayload = ssz.gloas.ExecutionPayload.defaultValue();
   executionPayload.slotNumber = 10;
   executionPayload.parentHash = Buffer.alloc(32, 5);

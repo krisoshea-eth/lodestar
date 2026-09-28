@@ -317,6 +317,19 @@ describe("SlotBidder", () => {
     expect(modules.policy.computeValue).toHaveBeenCalledWith({payloadValueGwei: 10, coverableGwei: 100});
   });
 
+  it("rejects a request for a different fork before preparing a payload", async () => {
+    const input = gloasInput();
+    input.job.request.fork = ForkName.heze;
+    const {bidder, modules} = setup(builtPayload(ForkName.gloas));
+
+    await expectSlotBidderError(bidder.run(input, new AbortController().signal), {
+      code: SlotBidderErrorCode.INPUT_FORK_MISMATCH,
+      fork: ForkName.gloas,
+      requestFork: ForkName.heze,
+    });
+    expect(modules.orchestrator.run).not.toHaveBeenCalled();
+  });
+
   it("rejects an input whose slot does not match its payload attributes", async () => {
     const input = gloasInput();
     input.job.request.payloadAttributes.slotNumber++;
@@ -507,7 +520,6 @@ function gloasInput(): GloasSlotBidInput {
           finalizedBlockHash: rootHex(11),
         },
         payloadAttributes,
-        custodyColumns: [0, 1],
       },
       getPayloadAt: 1_000,
     },
@@ -534,15 +546,12 @@ function hezeInput(inclusionListBits: heze.ExecutionPayloadBid["inclusionListBit
           finalizedBlockHash: rootHex(11),
         },
         payloadAttributes,
-        custodyColumns: [0, 1],
       },
       getPayloadAt: 1_000,
     },
   };
 }
 
-function builtPayload(fork: ForkName.gloas): BuiltPayload<ForkName.gloas>;
-function builtPayload(fork: ForkName.heze): BuiltPayload<ForkName.heze>;
 function builtPayload(fork: ForkName.gloas | ForkName.heze): BuiltPayload {
   if (fork === ForkName.heze) {
     const executionPayload = ssz.heze.ExecutionPayload.defaultValue();
