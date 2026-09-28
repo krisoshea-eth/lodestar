@@ -37,6 +37,7 @@ describe("Builder lifecycle component pipeline", () => {
         fork: ForkName.gloas,
         slot,
         parentBlockRoot,
+        prevRandao: ssz.gloas.PayloadAttributes.defaultValue().prevRandao,
         builderIndex,
         feeRecipient: Buffer.alloc(20, 4),
         value: 5,
