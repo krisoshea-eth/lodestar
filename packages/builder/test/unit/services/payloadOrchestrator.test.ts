@@ -18,8 +18,6 @@ import {
 
 const NOW = 1_000;
 
-type GloasPayloadBuildJob = Omit<PayloadBuildJob, "request"> & {request: BuildRequest<ForkName.gloas>};
-
 class StubPayloadSource implements PayloadSource {
   readonly id = "engine-0";
   readonly prepareCalls: BuildRequest[] = [];
@@ -34,26 +32,20 @@ class StubPayloadSource implements PayloadSource {
   getPayloadImpl: (handle: BuildHandle, signal: AbortSignal) => Promise<BuiltPayload> = async (handle) =>
     builtPayload(handle);
 
-  async prepare<F extends BuildRequest["fork"]>(
-    request: BuildRequest<F>,
-    signal: AbortSignal
-  ): Promise<BuildHandle<F>> {
+  async prepare(request: BuildRequest, signal: AbortSignal): Promise<BuildHandle> {
     this.prepareCalls.push(request);
     this.prepareSignals.push(signal);
-    return (await this.prepareImpl(request, signal)) as BuildHandle<F>;
+    return this.prepareImpl(request, signal);
   }
 
-  async getPayload<F extends BuildHandle["fork"]>(
-    handle: BuildHandle<F>,
-    signal: AbortSignal
-  ): Promise<BuiltPayload<F>> {
+  async getPayload(handle: BuildHandle, signal: AbortSignal): Promise<BuiltPayload> {
     this.getPayloadCalls.push(handle);
     this.getPayloadSignals.push(signal);
-    return (await this.getPayloadImpl(handle, signal)) as BuiltPayload<F>;
+    return this.getPayloadImpl(handle, signal);
   }
 }
 
-function buildRequest(): BuildRequest<ForkName.gloas> {
+function buildRequest(): BuildRequest {
   return {
     fork: ForkName.gloas,
     forkchoiceState: {
@@ -62,11 +54,10 @@ function buildRequest(): BuildRequest<ForkName.gloas> {
       finalizedBlockHash: `0x${"33".repeat(32)}`,
     },
     payloadAttributes: ssz.gloas.PayloadAttributes.defaultValue(),
-    custodyColumns: [0, 3, 127],
   };
 }
 
-function buildJob(id = "slot-1-full", getPayloadAt = NOW + 100): GloasPayloadBuildJob {
+function buildJob(id = "slot-1-full", getPayloadAt = NOW + 100): PayloadBuildJob {
   return {id, request: buildRequest(), getPayloadAt};
 }
 
@@ -96,6 +87,7 @@ describe("PayloadOrchestrator", () => {
     ["maxActiveJobs", 0, {maxActiveJobs: 0, getPayloadTimeout: 50}],
     ["getPayloadTimeout", 0, {maxActiveJobs: 1, getPayloadTimeout: 0}],
     ["maxActiveJobs", 1.5, {maxActiveJobs: 1.5, getPayloadTimeout: 50}],
+    ["getPayloadTimeout", 2 ** 31, {maxActiveJobs: 1, getPayloadTimeout: 2 ** 31}],
     [
       "getPayloadTimeout",
       Number.MAX_SAFE_INTEGER + 1,
@@ -109,7 +101,7 @@ describe("PayloadOrchestrator", () => {
     );
   });
 
-  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])(
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, NOW + 2 ** 31])(
     "rejects an invalid payload retrieval time %s",
     async (getPayloadAt) => {
       const source = new StubPayloadSource();
@@ -124,6 +116,45 @@ describe("PayloadOrchestrator", () => {
       expect(orchestrator.activeJobCount).toBe(0);
     }
   );
+
+  it("accepts the largest supported timer delay", async () => {
+    const source = new StubPayloadSource();
+    const timeout = 2 ** 31 - 1;
+    const orchestrator = new PayloadOrchestrator(source, {maxActiveJobs: 1, getPayloadTimeout: timeout});
+    const promise = orchestrator.run(buildJob("max-delay", NOW + timeout), new AbortController().signal);
+
+    await vi.advanceTimersByTimeAsync(timeout - 1);
+    expect(source.getPayloadCalls).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(promise).resolves.toEqual(builtPayload());
+    expect(orchestrator.activeJobCount).toBe(0);
+  });
+
+  it("rejects a preparation delay that overflows after the clock moves backwards", async () => {
+    const source = new StubPayloadSource();
+    const pendingPrepare = defer<BuildHandle>();
+    source.prepareImpl = () => pendingPrepare.promise;
+    const orchestrator = new PayloadOrchestrator(source, {maxActiveJobs: 1, getPayloadTimeout: 50});
+    const getPayloadAt = NOW + 2 ** 31 - 1;
+    const now = vi
+      .spyOn(Date, "now")
+      .mockReturnValueOnce(NOW)
+      .mockReturnValue(NOW - 1);
+
+    try {
+      const rejected = expect(
+        orchestrator.run(buildJob("clock-change", getPayloadAt), new AbortController().signal)
+      ).rejects.toMatchObject({
+        type: {code: PayloadOrchestratorErrorCode.INVALID_GET_PAYLOAD_AT, jobId: "clock-change", getPayloadAt},
+      });
+      await Promise.all([rejected, vi.advanceTimersByTimeAsync(1)]);
+      expect(source.prepareCalls).toHaveLength(0);
+      expect(orchestrator.activeJobCount).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      now.mockRestore();
+    }
+  });
 
   it("prepares immediately and retrieves at the requested time", async () => {
     const source = new StubPayloadSource();
@@ -204,10 +235,10 @@ describe("PayloadOrchestrator", () => {
   });
 
   it.each([
-    ["retrieval time", (job: GloasPayloadBuildJob) => ({...job, getPayloadAt: job.getPayloadAt + 1})],
+    ["retrieval time", (job: PayloadBuildJob) => ({...job, getPayloadAt: job.getPayloadAt + 1})],
     [
       "forkchoice state",
-      (job: GloasPayloadBuildJob) => ({
+      (job: PayloadBuildJob) => ({
         ...job,
         request: {
           ...job.request,
@@ -217,7 +248,7 @@ describe("PayloadOrchestrator", () => {
     ],
     [
       "payload attributes",
-      (job: GloasPayloadBuildJob) => ({
+      (job: PayloadBuildJob) => ({
         ...job,
         request: {
           ...job.request,
@@ -225,8 +256,7 @@ describe("PayloadOrchestrator", () => {
         },
       }),
     ],
-    ["custody columns", (job) => ({...job, request: {...job.request, custodyColumns: [0, 3, 126]}})],
-  ] satisfies [string, (job: GloasPayloadBuildJob) => PayloadBuildJob][])(
+  ] satisfies [string, (job: PayloadBuildJob) => PayloadBuildJob][])(
     "rejects reuse of an active job ID with different %s",
     async (_field, changeJob) => {
       const source = new StubPayloadSource();

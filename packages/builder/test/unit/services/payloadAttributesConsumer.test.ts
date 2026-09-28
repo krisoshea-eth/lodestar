@@ -10,10 +10,7 @@ import {toHex, toRootHex} from "@lodestar/utils";
 import {BidLedger} from "../../../src/services/bidLedger.js";
 import {BidPublisher} from "../../../src/services/bidPublisher.js";
 import {BuilderSigner} from "../../../src/services/builderSigner.js";
-import {
-  PayloadAttributesConsumer,
-  type PayloadAttributesConsumerOptions,
-} from "../../../src/services/payloadAttributesConsumer.js";
+import {PayloadAttributesConsumer} from "../../../src/services/payloadAttributesConsumer.js";
 import {PayloadStore} from "../../../src/services/payloadStore.js";
 import {ProposerPreferencesTracker} from "../../../src/services/proposerPreferencesTracker.js";
 import {type SlotBidResult, SlotBidder} from "../../../src/services/slotBidder.js";
@@ -40,7 +37,6 @@ describe("Gloas payload-attributes consumer experiment", () => {
     });
     expect(input.job.request.payloadAttributes.suggestedFeeRecipient).toBe(toHex(executionFeeRecipient));
     expect(input.proposerFeeRecipient).toEqual(Buffer.alloc(20, 8));
-    expect(input.job.request.custodyColumns).toEqual([0, 3]);
     expect(ssz.gloas.SSEPayloadAttributes.toJson(attributes.message.data)).toEqual(original);
   });
 
@@ -145,21 +141,6 @@ describe("Gloas payload-attributes consumer experiment", () => {
     controller.abort();
     resolve({status: "not_published", reason: "policy_declined"});
     expect((await results).map((result) => result.status)).toEqual(["rejected", "rejected"]);
-  });
-
-  it.each([undefined, [-1], [128], [0.5]])("rejects invalid custody configuration %s", (columns) => {
-    const {config, clock, tracker, run, executionFeeRecipient} = setup();
-    const options: PayloadAttributesConsumerOptions = {
-      executionFeeRecipient,
-      custodyColumns: null,
-      deadlineBps: 5000,
-      maxInputsPerSlot: 2,
-    };
-    if (columns === undefined) Reflect.deleteProperty(options, "custodyColumns");
-    else options.custodyColumns = columns;
-    expect(() => new PayloadAttributesConsumer({config, clock, preferences: tracker, bidder: {run}}, options)).toThrow(
-      "PAYLOAD_INPUT_INVALID_OPTIONS"
-    );
   });
 
   it("waits for the matching head when attributes arrive first", async () => {
@@ -304,7 +285,7 @@ describe("Gloas payload-attributes consumer experiment", () => {
     const clock = new Clock(config, getMockedLogger(), {genesisTime: 0});
     const consumer = new PayloadAttributesConsumer(
       {config, clock, preferences: tracker, bidder: {run}},
-      {executionFeeRecipient, custodyColumns: null, deadlineBps, maxInputsPerSlot: 2}
+      {executionFeeRecipient, deadlineBps, maxInputsPerSlot: 2}
     );
     await consumer.onEvent(head, signal);
     const result = await consumer.onEvent(attributes, signal);
@@ -314,7 +295,6 @@ describe("Gloas payload-attributes consumer experiment", () => {
     } else {
       expect(result).toMatchObject({status: "published"});
       expect(run.mock.calls[0][0].job.getPayloadAt).toBe(slotStart + config.getSlotComponentDurationMs(deadlineBps));
-      expect(run.mock.calls[0][0].job.request.custodyColumns).toBeNull();
     }
   });
 });
@@ -374,7 +354,7 @@ function setup(slot = 10, withPreference = true) {
   const executionFeeRecipient = Buffer.alloc(20, 9);
   const consumer = new PayloadAttributesConsumer(
     {config, clock, preferences: tracker, bidder: {run}},
-    {executionFeeRecipient, custodyColumns: [0, 3], deadlineBps: 9000, maxInputsPerSlot: 2}
+    {executionFeeRecipient, deadlineBps: 9000, maxInputsPerSlot: 2}
   );
   const controller = new AbortController();
   return {

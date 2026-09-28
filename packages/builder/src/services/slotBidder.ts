@@ -7,26 +7,15 @@ import type {BidPolicy} from "./bidPolicy.js";
 import type {BidPublisher} from "./bidPublisher.js";
 import {createExecutionPayloadBid} from "./executionPayloadBid.js";
 import type {PayloadBuildJob, PayloadOrchestrator} from "./payloadOrchestrator.js";
-import type {BuildRequest, BuiltPayload} from "./payloadSource.js";
+import type {BuiltPayload} from "./payloadSource.js";
 import type {StoredPayload} from "./payloadStore.js";
-
-function isBuiltPayloadFor<F extends ForkName.gloas | ForkName.heze>(
-  payload: BuiltPayload,
-  fork: F
-): payload is BuiltPayload<F> {
-  return payload.fork === fork;
-}
-
-type SlotBuildJob<F extends ForkName.gloas | ForkName.heze> = Omit<PayloadBuildJob, "request"> & {
-  request: BuildRequest<F>;
-};
 
 type CommonSlotBidInput<F extends ForkName.gloas | ForkName.heze> = {
   fork: F;
   slot: Slot;
   parentBlockRoot: Root;
   proposerFeeRecipient: ExecutionAddress;
-  job: SlotBuildJob<F>;
+  job: PayloadBuildJob;
 };
 
 export type GloasSlotBidInput = CommonSlotBidInput<ForkName.gloas>;
@@ -38,8 +27,8 @@ export type HezeSlotBidInput = CommonSlotBidInput<ForkName.heze> & {
 export type SlotBidInput = GloasSlotBidInput | HezeSlotBidInput;
 
 type MatchedSlotBidInput =
-  | {fork: ForkName.gloas; input: GloasSlotBidInput; payload: BuiltPayload<ForkName.gloas>}
-  | {fork: ForkName.heze; input: HezeSlotBidInput; payload: BuiltPayload<ForkName.heze>};
+  | {fork: ForkName.gloas; input: GloasSlotBidInput; payload: BuiltPayload}
+  | {fork: ForkName.heze; input: HezeSlotBidInput; payload: BuiltPayload};
 
 export type SlotBidderModules = {
   orchestrator: Pick<PayloadOrchestrator, "run">;
@@ -278,11 +267,11 @@ export class SlotBidder {
   }
 
   private matchPayload(input: SlotBidInput, payload: BuiltPayload): MatchedSlotBidInput {
-    if (input.fork === ForkName.gloas && isBuiltPayloadFor(payload, input.fork)) {
+    if (input.fork === ForkName.gloas && payload.fork === input.fork) {
       this.assertPayload(input, payload);
       return {fork: input.fork, input, payload};
     }
-    if (input.fork === ForkName.heze && isBuiltPayloadFor(payload, input.fork)) {
+    if (input.fork === ForkName.heze && payload.fork === input.fork) {
       this.assertPayload(input, payload);
       return {fork: input.fork, input, payload};
     }
@@ -295,7 +284,7 @@ export class SlotBidder {
 
   private assertPayload<F extends ForkName.gloas | ForkName.heze>(
     input: CommonSlotBidInput<F>,
-    payload: BuiltPayload<F>
+    payload: BuiltPayload
   ): void {
     if (payload.executionPayload.slotNumber !== input.slot) {
       throw new SlotBidderError(

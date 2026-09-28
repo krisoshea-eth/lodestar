@@ -66,6 +66,40 @@ describe("createExecutionPayloadBid", () => {
     expect(bid.executionRequestsRoot).toEqual(ssz.heze.ExecutionRequests.hashTreeRoot(payload.executionRequests));
   });
 
+  it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number("0x20000000000001"), Number("0xffffffffffffffff")])(
+    "rejects an inexact or invalid payload gas limit %s",
+    (gasLimit) => {
+      const payload = createBuiltPayload(ForkName.gloas);
+      payload.executionPayload.gasLimit = gasLimit;
+      expect(() =>
+        createExecutionPayloadBid({
+          fork: ForkName.gloas,
+          slot,
+          parentBlockRoot,
+          builderIndex,
+          feeRecipient,
+          value: 1,
+          payload,
+        })
+      ).toThrowError(expect.objectContaining({type: {code: ExecutionPayloadBidErrorCode.INVALID_GAS_LIMIT, gasLimit}}));
+    }
+  );
+
+  it("preserves the maximum safely representable gas limit", () => {
+    const payload = createBuiltPayload(ForkName.gloas);
+    payload.executionPayload.gasLimit = Number.MAX_SAFE_INTEGER;
+    const bid = createExecutionPayloadBid({
+      fork: ForkName.gloas,
+      slot,
+      parentBlockRoot,
+      builderIndex,
+      feeRecipient,
+      value: 1,
+      payload,
+    });
+    expect(bid.gasLimit).toBe(BigInt(Number.MAX_SAFE_INTEGER));
+  });
+
   it.each([Number.NaN, Number.POSITIVE_INFINITY, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
     "rejects invalid bid value %s",
     (value) => {
@@ -89,7 +123,7 @@ describe("createExecutionPayloadBid", () => {
   );
 
   it("rejects a runtime payload fork mismatch", () => {
-    const payload = createBuiltPayload(ForkName.heze) as unknown as BuiltPayload<ForkName.gloas>;
+    const payload = createBuiltPayload(ForkName.heze);
 
     expect(() =>
       createExecutionPayloadBid({
@@ -134,7 +168,7 @@ describe("createExecutionPayloadBid", () => {
   });
 });
 
-function createBuiltPayload<F extends ForkName.gloas | ForkName.heze>(fork: F): BuiltPayload<F> {
+function createBuiltPayload(fork: ForkName.gloas | ForkName.heze): BuiltPayload {
   const forkTypes = fork === ForkName.heze ? ssz.heze : ssz.gloas;
   const executionPayload = forkTypes.ExecutionPayload.defaultValue();
   executionPayload.slotNumber = 10;
@@ -149,5 +183,5 @@ function createBuiltPayload<F extends ForkName.gloas | ForkName.heze>(fork: F): 
     executionRequests: forkTypes.ExecutionRequests.defaultValue(),
     blobsBundle: forkTypes.BlobsBundle.defaultValue(),
     executionPayloadValue: 1n,
-  } as BuiltPayload<F>;
+  };
 }

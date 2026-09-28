@@ -438,7 +438,7 @@ describe("Builder", () => {
         source: source as unknown as PayloadSource,
         policy: {computeValue: () => 1},
         orchestration: {maxActiveJobs: 1, getPayloadTimeout: 1000},
-        inputs: {custodyColumns: [0, 3], deadlineBps: 9000, maxInputsPerSlot: 2},
+        inputs: {deadlineBps: 9000, maxInputsPerSlot: 2},
         minOperatingBalanceGwei: MIN_DEPOSIT_AMOUNT,
       };
       return {events, source, payload, publish, options: modules.opts.bidRuntime};
@@ -462,7 +462,6 @@ describe("Builder", () => {
           safeBlockHash: toRootHex(events.attributes.message.data.safeBlockHash),
           finalizedBlockHash: toRootHex(events.attributes.message.data.finalizedBlockHash),
         },
-        custodyColumns: [0, 3],
       });
       expect(source.getPayload).toHaveBeenCalledOnce();
       expect(publish).toHaveBeenCalledOnce();
@@ -785,7 +784,6 @@ function configureInputs(modules: BuilderModules, clock: ClockMock) {
     {config, clock, preferences: modules.proposerPreferencesTracker, bidder: {run}},
     {
       executionFeeRecipient: modules.opts.executionFeeRecipient,
-      custodyColumns: [0, 3],
       deadlineBps: 9000,
       maxInputsPerSlot: 2,
     }

@@ -256,7 +256,7 @@ export class Builder {
               createExecutionPayloadEnvelopeMaterial({
                 blockRoot: selected.blockRoot,
                 builderIndex: index,
-                selectedBid: selected.bid,
+                selectedBid: observed.block.message.body.signedExecutionPayloadBid.message,
                 storedPayload,
               }),
               publicationSignal

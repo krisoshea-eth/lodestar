@@ -23,8 +23,10 @@ describe("payload build pipeline", () => {
     const blobsBundle = ssz.gloas.BlobsBundle.defaultValue();
     const executionRequests = ssz.gloas.ExecutionRequests.defaultValue();
     const executionPayloadValue = 12_345_678_901_234_567_890n;
-    const notifyForkchoiceUpdate = vi.fn().mockResolvedValue("0x0102030405060708");
-    const getPayload = vi.fn().mockResolvedValue({
+    const notifyForkchoiceUpdate = vi
+      .fn<PayloadSourceEngine["notifyForkchoiceUpdate"]>()
+      .mockResolvedValue("0x0102030405060708");
+    const getPayload = vi.fn<PayloadSourceEngine["getPayload"]>().mockResolvedValue({
       executionPayload,
       blobsBundle,
       executionRequests,
@@ -33,7 +35,7 @@ describe("payload build pipeline", () => {
     const source = new EnginePayloadSource("engine-0", {
       notifyForkchoiceUpdate,
       getPayload,
-    } as unknown as PayloadSourceEngine);
+    });
     const orchestrator = new PayloadOrchestrator(source, {maxActiveJobs: 1, getPayloadTimeout: 50});
     const store = new PayloadStore();
     const parentBlockRoot = Uint8Array.from({length: 32}, () => 5);
@@ -53,7 +55,6 @@ describe("payload build pipeline", () => {
             finalizedBlockHash: `0x${"33".repeat(32)}`,
           },
           payloadAttributes,
-          custodyColumns: [0, 3, 127],
         },
         getPayloadAt: 1_100,
       },
@@ -67,7 +68,15 @@ describe("payload build pipeline", () => {
     store.add(storedPayload);
     const stored = store.get(blockHash);
 
-    expect(notifyForkchoiceUpdate).toHaveBeenCalledOnce();
+    expect(notifyForkchoiceUpdate).toHaveBeenCalledExactlyOnceWith(
+      ForkName.gloas,
+      toRootHex(executionPayload.parentHash),
+      `0x${"22".repeat(32)}`,
+      `0x${"33".repeat(32)}`,
+      payloadAttributes,
+      null,
+      expect.any(AbortSignal)
+    );
     expect(getPayload).toHaveBeenCalledWith(ForkName.gloas, "0x0102030405060708", expect.any(AbortSignal));
     expect(stored).toMatchObject({slot: 10, parentBlockRoot, blockHash});
     expect(stored?.payload).toBe(payload);

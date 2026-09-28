@@ -1,8 +1,8 @@
 import {routes} from "@lodestar/api";
 import type {ChainForkConfig} from "@lodestar/config";
-import {ForkName, NUMBER_OF_COLUMNS} from "@lodestar/params";
+import {ForkName} from "@lodestar/params";
 import {type IClock, computeEpochAtSlot, computeTimeAtSlot} from "@lodestar/state-transition";
-import {type ColumnIndex, type ExecutionAddress, type gloas, ssz} from "@lodestar/types";
+import {type ExecutionAddress, type gloas, ssz} from "@lodestar/types";
 import {ErrorAborted, LodestarError, toHex, toRootHex} from "@lodestar/utils";
 import type {ProposerPreferencesTracker} from "./proposerPreferencesTracker.js";
 import type {SlotBidResult, SlotBidder} from "./slotBidder.js";
@@ -19,7 +19,6 @@ export type PayloadAttributesConsumerModules = {
 
 export type PayloadAttributesConsumerOptions = {
   executionFeeRecipient: ExecutionAddress;
-  custodyColumns: ColumnIndex[] | null;
   /** Retrieval point in the slot before proposalSlot, not the payload reveal deadline. */
   deadlineBps: number;
   maxInputsPerSlot: number;
@@ -44,12 +43,7 @@ export class PayloadAttributesConsumer {
       options.deadlineBps >= 10_000 ||
       !Number.isSafeInteger(options.maxInputsPerSlot) ||
       options.maxInputsPerSlot < 1 ||
-      options.executionFeeRecipient.length !== 20 ||
-      (options.custodyColumns !== null &&
-        (!Array.isArray(options.custodyColumns) ||
-          options.custodyColumns.some(
-            (index) => !Number.isSafeInteger(index) || index < 0 || index >= NUMBER_OF_COLUMNS
-          )))
+      options.executionFeeRecipient.length !== 20
     ) {
       throw new LodestarError({code: "PAYLOAD_INPUT_INVALID_OPTIONS"});
     }
@@ -169,7 +163,6 @@ export class PayloadAttributesConsumer {
                 finalizedBlockHash: toRootHex(data.finalizedBlockHash),
               },
               payloadAttributes,
-              custodyColumns: this.options.custodyColumns === null ? null : this.options.custodyColumns.slice(),
             },
           },
         },
