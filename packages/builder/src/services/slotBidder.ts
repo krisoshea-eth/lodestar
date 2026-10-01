@@ -27,8 +27,8 @@ export type HezeSlotBidInput = CommonSlotBidInput<ForkName.heze> & {
 export type SlotBidInput = GloasSlotBidInput | HezeSlotBidInput;
 
 type MatchedSlotBidInput =
-  | {fork: ForkName.gloas; input: GloasSlotBidInput; payload: BuiltPayload}
-  | {fork: ForkName.heze; input: HezeSlotBidInput; payload: BuiltPayload};
+  | {fork: ForkName.gloas; input: GloasSlotBidInput; payload: BuiltPayload & {fork: ForkName.gloas}}
+  | {fork: ForkName.heze; input: HezeSlotBidInput; payload: BuiltPayload & {fork: ForkName.heze}};
 
 export type SlotBidderModules = {
   orchestrator: Pick<PayloadOrchestrator, "run">;
@@ -192,7 +192,6 @@ export class SlotBidder {
     const bid =
       matched.fork === ForkName.heze
         ? createExecutionPayloadBid({
-            fork: matched.fork,
             slot: matched.input.slot,
             parentBlockRoot: matched.input.parentBlockRoot,
             prevRandao: matched.input.job.request.payloadAttributes.prevRandao,
@@ -203,7 +202,6 @@ export class SlotBidder {
             inclusionListBits: matched.input.inclusionListBits,
           })
         : createExecutionPayloadBid({
-            fork: matched.fork,
             slot: matched.input.slot,
             parentBlockRoot: matched.input.parentBlockRoot,
             prevRandao: matched.input.job.request.payloadAttributes.prevRandao,
@@ -271,11 +269,11 @@ export class SlotBidder {
   private matchPayload(input: SlotBidInput, payload: BuiltPayload): MatchedSlotBidInput {
     if (input.fork === ForkName.gloas && payload.fork === input.fork) {
       this.assertPayload(input, payload);
-      return {fork: input.fork, input, payload};
+      return {fork: input.fork, input, payload: payload as BuiltPayload & {fork: ForkName.gloas}};
     }
     if (input.fork === ForkName.heze && payload.fork === input.fork) {
       this.assertPayload(input, payload);
-      return {fork: input.fork, input, payload};
+      return {fork: input.fork, input, payload: payload as BuiltPayload & {fork: ForkName.heze}};
     }
 
     throw new SlotBidderError(

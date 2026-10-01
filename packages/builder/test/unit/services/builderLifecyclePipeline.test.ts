@@ -34,7 +34,6 @@ describe("Builder lifecycle component pipeline", () => {
       store.add(storedPayload);
 
       const bid = createExecutionPayloadBid({
-        fork: ForkName.gloas,
         slot,
         parentBlockRoot,
         prevRandao: ssz.gloas.PayloadAttributes.defaultValue().prevRandao,
@@ -139,7 +138,7 @@ describe("Builder lifecycle component pipeline", () => {
   );
 });
 
-function createBuiltPayload(): BuiltPayload {
+function createBuiltPayload(): BuiltPayload & {fork: ForkName.gloas} {
   const executionPayload = ssz.gloas.ExecutionPayload.defaultValue();
   executionPayload.slotNumber = 10;
   executionPayload.parentHash = Buffer.alloc(32, 5);
