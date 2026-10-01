@@ -8,6 +8,7 @@ export type SubmittedBid = {
   parentBlockRoot: RootHex;
   blockHash: RootHex;
   valueGwei: number;
+  signedBidRoot: RootHex;
 };
 
 export type BidIdentity = Pick<SubmittedBid, "slot" | "parentBlockHash" | "parentBlockRoot" | "blockHash">;
@@ -19,6 +20,8 @@ export type BidLedgerRecord = SubmittedBid & {
 type RevealedPayload = {
   slot: Slot;
   blockHash: RootHex;
+  envelopeRoot: RootHex;
+  published: boolean;
 };
 
 type MutableBidLedgerRecord = SubmittedBid & {
@@ -29,6 +32,7 @@ type MutableBidLedgerRecord = SubmittedBid & {
 export enum BidLedgerErrorCode {
   INVALID_BID_VALUE = "BID_LEDGER_ERROR_INVALID_BID_VALUE",
   DUPLICATE_BID = "BID_LEDGER_ERROR_DUPLICATE_BID",
+  BID_TOO_OLD = "BID_LEDGER_ERROR_BID_TOO_OLD",
   REVEAL_CONFLICT = "BID_LEDGER_ERROR_REVEAL_CONFLICT",
   UNSETTLED_VALUE_OVERFLOW = "BID_LEDGER_ERROR_UNSETTLED_VALUE_OVERFLOW",
 }
@@ -45,10 +49,17 @@ export type BidLedgerErrorType =
       parentBlockRoot: RootHex;
     }
   | {
+      code: BidLedgerErrorCode.BID_TOO_OLD;
+      slot: Slot;
+      oldestSlot: Slot;
+    }
+  | {
       code: BidLedgerErrorCode.REVEAL_CONFLICT;
       blockRoot: RootHex;
       blockHash: RootHex;
       revealedBlockHash: RootHex;
+      envelopeRoot: RootHex;
+      revealedEnvelopeRoot: RootHex;
     }
   | {
       code: BidLedgerErrorCode.UNSETTLED_VALUE_OVERFLOW;
@@ -60,13 +71,30 @@ export class BidLedgerError extends LodestarError<BidLedgerErrorType> {}
 const RECORD_RETENTION_EPOCHS = 3;
 const KEEP_SLOTS = RECORD_RETENTION_EPOCHS * SLOTS_PER_EPOCH;
 
-/** Tracks one-shot bids and reveal obligations without owning signing, publication, or persistence. */
+/** Tracks at most one bid per (slot, parentBlockHash, parentBlockRoot) and its reveal obligations. */
 export class BidLedger {
   private readonly bidsBySlot = new Map<Slot, Map<string, MutableBidLedgerRecord>>();
   private readonly revealedPayloadByBlockRoot = new Map<RootHex, RevealedPayload>();
+  private oldestSlot = 0;
 
   hasSubmitted(slot: Slot, parentBlockHash: RootHex, parentBlockRoot: RootHex): boolean {
     return this.bidsBySlot.get(slot)?.has(tupleKey(parentBlockHash, parentBlockRoot)) ?? false;
+  }
+
+  assertCanRecordBid({
+    slot,
+    parentBlockHash,
+    parentBlockRoot,
+  }: Pick<SubmittedBid, "slot" | "parentBlockHash" | "parentBlockRoot">): void {
+    if (slot < this.oldestSlot) {
+      throw new BidLedgerError({code: BidLedgerErrorCode.BID_TOO_OLD, slot, oldestSlot: this.oldestSlot});
+    }
+    if (this.hasSubmitted(slot, parentBlockHash, parentBlockRoot)) {
+      throw new BidLedgerError(
+        {code: BidLedgerErrorCode.DUPLICATE_BID, slot, parentBlockHash, parentBlockRoot},
+        `Bid already recorded slot=${slot} parentBlockHash=${parentBlockHash} parentBlockRoot=${parentBlockRoot}`
+      );
+    }
   }
 
   recordBid(bid: SubmittedBid): BidLedgerRecord {
@@ -77,6 +105,7 @@ export class BidLedger {
       );
     }
 
+    this.assertCanRecordBid(bid);
     let bidsForSlot = this.bidsBySlot.get(bid.slot);
     if (bidsForSlot === undefined) {
       bidsForSlot = new Map();
@@ -84,26 +113,14 @@ export class BidLedger {
     }
 
     const key = tupleKey(bid.parentBlockHash, bid.parentBlockRoot);
-    if (bidsForSlot.has(key)) {
-      throw new BidLedgerError(
-        {
-          code: BidLedgerErrorCode.DUPLICATE_BID,
-          slot: bid.slot,
-          parentBlockHash: bid.parentBlockHash,
-          parentBlockRoot: bid.parentBlockRoot,
-        },
-        `Bid already recorded slot=${bid.slot} parentBlockHash=${bid.parentBlockHash} parentBlockRoot=${bid.parentBlockRoot}`
-      );
-    }
-
     const record = {...bid, wonBlockRoots: new Set<RootHex>(), paymentSettled: false};
     bidsForSlot.set(key, record);
     return toRecord(record);
   }
 
-  recordWin(identity: BidIdentity, blockRoot: RootHex): BidLedgerRecord | null {
+  recordWin(identity: BidIdentity & Pick<SubmittedBid, "signedBidRoot">, blockRoot: RootHex): BidLedgerRecord | null {
     const record = this.getBid(identity.slot, identity.parentBlockHash, identity.parentBlockRoot);
-    if (record === null || record.blockHash !== identity.blockHash) {
+    if (record === null || record.blockHash !== identity.blockHash || record.signedBidRoot !== identity.signedBidRoot) {
       return null;
     }
 
@@ -122,33 +139,50 @@ export class BidLedger {
     return toRecord(record);
   }
 
-  canReveal(blockRoot: RootHex, blockHash: RootHex): boolean {
+  canReveal(blockRoot: RootHex, blockHash: RootHex, envelopeRoot: RootHex): boolean {
     const revealedPayload = this.revealedPayloadByBlockRoot.get(blockRoot);
-    return revealedPayload === undefined || revealedPayload.blockHash === blockHash;
+    return (
+      revealedPayload === undefined ||
+      (revealedPayload.blockHash === blockHash && revealedPayload.envelopeRoot === envelopeRoot)
+    );
   }
 
   hasRevealed(blockRoot: RootHex): boolean {
     return this.revealedPayloadByBlockRoot.has(blockRoot);
   }
 
-  recordReveal(slot: Slot, blockRoot: RootHex, blockHash: RootHex): void {
+  hasPublishedReveal(blockRoot: RootHex): boolean {
+    return this.revealedPayloadByBlockRoot.get(blockRoot)?.published ?? false;
+  }
+
+  recordReveal(slot: Slot, blockRoot: RootHex, blockHash: RootHex, envelopeRoot: RootHex): void {
     const revealedPayload = this.revealedPayloadByBlockRoot.get(blockRoot);
     if (revealedPayload !== undefined) {
-      if (revealedPayload.blockHash !== blockHash) {
+      if (revealedPayload.blockHash !== blockHash || revealedPayload.envelopeRoot !== envelopeRoot) {
         throw new BidLedgerError(
           {
             code: BidLedgerErrorCode.REVEAL_CONFLICT,
             blockRoot,
             blockHash,
             revealedBlockHash: revealedPayload.blockHash,
+            envelopeRoot,
+            revealedEnvelopeRoot: revealedPayload.envelopeRoot,
           },
-          `Envelope already recorded blockRoot=${blockRoot} blockHash=${revealedPayload.blockHash}`
+          `Different envelope already recorded blockRoot=${blockRoot} envelopeRoot=${revealedPayload.envelopeRoot}`
         );
       }
       return;
     }
 
-    this.revealedPayloadByBlockRoot.set(blockRoot, {slot, blockHash});
+    this.revealedPayloadByBlockRoot.set(blockRoot, {slot, blockHash, envelopeRoot, published: false});
+  }
+
+  recordRevealPublished(slot: Slot, blockRoot: RootHex, blockHash: RootHex, envelopeRoot: RootHex): void {
+    this.recordReveal(slot, blockRoot, blockHash, envelopeRoot);
+    const revealedPayload = this.revealedPayloadByBlockRoot.get(blockRoot);
+    if (revealedPayload !== undefined) {
+      revealedPayload.published = true;
+    }
   }
 
   getUnsettledValueGwei(currentEpoch: Epoch): number {
@@ -176,9 +210,11 @@ export class BidLedger {
   }
 
   prune(currentSlot: Slot): number {
+    // Pruning must not make an expired slot eligible for another submission.
+    this.oldestSlot = Math.max(this.oldestSlot, currentSlot - KEEP_SLOTS);
     let removed = 0;
     for (const [slot, bidsForSlot] of this.bidsBySlot) {
-      if (slot >= currentSlot - KEEP_SLOTS) {
+      if (slot >= this.oldestSlot) {
         continue;
       }
 
@@ -217,6 +253,7 @@ function toRecord(record: MutableBidLedgerRecord): BidLedgerRecord {
     parentBlockRoot: record.parentBlockRoot,
     blockHash: record.blockHash,
     valueGwei: record.valueGwei,
+    signedBidRoot: record.signedBidRoot,
     wonBlockRoots: Array.from(record.wonBlockRoots),
   };
 }
